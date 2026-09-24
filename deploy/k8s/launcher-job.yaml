@@ -24,6 +24,11 @@ spec:
               valueFrom: {secretKeyRef: {name: sa-secrets, key: gitea-admin-password}}
             - name: ANTHROPIC_API_KEY
               valueFrom: {secretKeyRef: {name: sa-secrets, key: anthropic-api-key, optional: true}}
+            # AGS provider only (the real service or the mock). Never forwarded into sandboxes.
+            - name: TENCENTCLOUD_SECRET_ID
+              valueFrom: {secretKeyRef: {name: sa-tencentcloud, key: secret-id, optional: true}}
+            - name: TENCENTCLOUD_SECRET_KEY
+              valueFrom: {secretKeyRef: {name: sa-tencentcloud, key: secret-key, optional: true}}
           volumeMounts: [{name: run, mountPath: /config}]
       volumes:
         - name: run

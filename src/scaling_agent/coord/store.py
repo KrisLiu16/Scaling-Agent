@@ -773,11 +773,15 @@ class Store:
             )
         return cur.rowcount
 
-    async def merge_next(self) -> MergeRequest | None:
-        """Claim the oldest queued request for processing (single consumer)."""
+    async def merge_next(self, skip: Iterable[int] = ()) -> MergeRequest | None:
+        """Claim the oldest queued request for processing (single consumer), except `skip` (deferred)."""
+        skip = list(skip)
         async with self._tx():
             row = await self._fetchone(
-                "SELECT * FROM merge_queue WHERE status=? ORDER BY id LIMIT 1", (MergeStatus.QUEUED.value,)
+                "SELECT * FROM merge_queue WHERE status=?"
+                + (f" AND id NOT IN ({','.join('?' * len(skip))})" if skip else "")
+                + " ORDER BY id LIMIT 1",
+                (MergeStatus.QUEUED.value, *skip),
             )
             if row is None:
                 return None

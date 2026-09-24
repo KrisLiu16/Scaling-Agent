@@ -93,6 +93,7 @@ class K8sProvider(SandboxProvider):
                 containers=[container],
                 restart_policy="Always",
                 automount_service_account_token=False,  # a worker has no business with the k8s API
+                enable_service_links=False,  # no *_SERVICE_HOST env advertising other services
                 volumes=[c.V1Volume(name="workspace", empty_dir=c.V1EmptyDirVolumeSource())],
             ),
         )

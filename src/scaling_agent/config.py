@@ -101,8 +101,14 @@ class ProviderSettings(BaseModel):
     # Tencent Cloud AGS. Credentials come from TENCENTCLOUD_SECRET_ID / TENCENTCLOUD_SECRET_KEY in the
     # launcher's environment and never enter a sandbox. Console rid=9 is ap-singapore.
     region: str = "ap-singapore"
-    endpoint: str = "ags.tencentcloudapi.com"
+    endpoint: str = "ags.tencentcloudapi.com"  # or http(s)://host:port (e.g. the local mock AGS)
     data_plane_domain: str | None = None  # default: {region}.tencentags.com
+    # Send all envd traffic to one gateway URL (routed by the E2b-Sandbox-Id header) instead of the
+    # per-sandbox `{port}-{id}.{domain}` hosts. Used with the local mock AGS.
+    data_plane_url: str | None = None
+    # Extra envd flags in the tool's start command (the e2b-built envd needs
+    # "-isnotfc -no-cgroups" outside Firecracker; AGS's own envd needs none).
+    envd_flags: str = ""
     tool_name: str = "sa-worker"
     image: str | None = None  # linux/amd64 image that contains /usr/bin/envd (see deploy/worker.Dockerfile)
     image_registry_type: Literal["enterprise", "personal", "custom"] = "personal"

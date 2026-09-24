@@ -25,6 +25,10 @@ from .base import SandboxHandle, SandboxProvider
 
 log = logging.getLogger(__name__)
 
+# Set on the runtime process so `commands.list()` can find it; matching the command text breaks
+# as soon as the command contains quotes (it reaches envd re-quoted inside `bash -lc`).
+RUNTIME_MARKER = "SA_RUNTIME_MARKER"
+
 
 def _parse_expiry(value: str | None) -> float | None:
     if not value:
@@ -64,6 +68,7 @@ class AgsProvider(SandboxProvider):
             security_group_ids=self.s.security_group_ids,
             default_timeout=None if self.s.persistent else (self.s.instance_timeout or "24h"),
             persistent=self.s.persistent,
+            args=[f"exec /usr/bin/envd -port {ENVD_PORT} {self.s.envd_flags}".strip()],
         )
         self.tool_id = await asyncio.to_thread(self.cp.ensure_tool, spec)
         quota = await asyncio.to_thread(self.cp.quota)
@@ -86,6 +91,7 @@ class AgsProvider(SandboxProvider):
         cfg = ConnectionConfig(
             domain=self.domain,
             request_timeout=60,
+            sandbox_url=self.s.data_plane_url,  # None: per-sandbox hosts; else one gateway routed by headers
             extra_sandbox_headers={"X-Access-Token": token, "E2b-Sandbox-Id": instance_id, "E2b-Sandbox-Port": str(ENVD_PORT)},
         )
         return AsyncSandbox(
@@ -100,14 +106,33 @@ class AgsProvider(SandboxProvider):
         sbx = await self._sandbox(handle.sandbox_id)
         workdir = env.get("SA_WORKER_WORKDIR", "/workspace/repo")
         state_dir = env.get("SA_WORKER_STATE_DIR", "/workspace/state")
+        base = os.path.dirname(workdir.rstrip("/")) or "/"
         cmd = (
-            f"mkdir -p /workspace {shlex.quote(state_dir)} && "
+            f"mkdir -p {shlex.quote(base)} {shlex.quote(state_dir)} && "
             f"exec {self.s.runtime_command} >> {shlex.quote(state_dir)}/runtime.log 2>&1"
         )
+        existing = await self._runtime_pid(sbx)
+        if existing is not None:  # re-attached to a sandbox whose runtime is already running
+            handle.meta["pid"] = str(existing)
+            return
         proc = await sbx.commands.run(
-            f"bash -lc {shlex.quote(cmd)}", background=True, envs=env, cwd="/workspace", user="root", timeout=0
+            f"bash -lc {shlex.quote(cmd)}",
+            background=True,
+            envs={**env, RUNTIME_MARKER: handle.worker_id},
+            cwd="/",
+            user="root",
+            timeout=0,
         )
         handle.meta["pid"] = str(proc.pid)
+        # Drop the event stream; the process keeps running. Otherwise the launcher holds one
+        # long-lived HTTP stream per worker for the whole run.
+        await proc.disconnect()
+
+    async def _runtime_pid(self, sbx) -> int | None:
+        for p in await sbx.commands.list():
+            if RUNTIME_MARKER in (p.envs or {}):
+                return p.pid
+        return None
 
     async def start(self, worker_id: str, env: dict[str, str], replaces: str | None = None) -> SandboxHandle:
         if self.tool_id is None:
@@ -133,12 +158,24 @@ class AgsProvider(SandboxProvider):
             return False
         try:
             sbx = await self._sandbox(handle.sandbox_id)
-            return any(str(p.pid) == pid for p in await sbx.commands.list())
+            found = await self._runtime_pid(sbx)
+            if found is not None:
+                handle.meta["pid"] = str(found)
+            return found is not None
         except Exception:
-            # Unknown, not dead: relaunching now could start a second runtime next to a live one.
             log.warning("could not list processes in %s", handle.sandbox_id, exc_info=True)
             self._tokens.pop(handle.sandbox_id, None)  # maybe an expired token; refresh next time
+        # envd did not answer. A dead instance means a dead runtime (relaunch replaces it); if the
+        # instance is still up the state is unknown, and relaunching could start a second runtime.
+        try:
+            inst = await asyncio.to_thread(self.cp.get_instance, handle.sandbox_id)
+        except Exception:
+            log.warning("could not describe %s", handle.sandbox_id, exc_info=True)
             return None
+        if inst is None or inst.Status not in ("STARTING", "RUNNING"):
+            log.warning("%s instance %s is %s", handle.worker_id, handle.sandbox_id, inst.Status if inst else "gone")
+            return False
+        return None
 
     async def relaunch(self, handle: SandboxHandle, env: dict[str, str]) -> None:
         inst = await asyncio.to_thread(self.cp.get_instance, handle.sandbox_id)

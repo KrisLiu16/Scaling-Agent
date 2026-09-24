@@ -44,6 +44,7 @@ class ScriptedAdapter(HarnessAdapter):
         self.n = 0
         self.state = "idle"
         self.claim_id: int | None = None
+        self._adopted = False  # released claims left over from before a restart
         self.branch = ""
         self.pr: int | None = None
         self.calls = 0
@@ -101,6 +102,15 @@ class ScriptedAdapter(HarnessAdapter):
 
     # ------------------------------------------------------------------- steps
 
+    async def _finish_feature(self, evidence: str) -> None:
+        await self._mcp(
+            "board_write",
+            {"type": "PATCH_SUMMARY", "text": f"files=features/{self.worker}_{self.n}.py,{REGISTRY} | idea=feature {self.n} | evidence={evidence}"},
+        )
+        if self.claim_id:
+            await self._mcp("release_claim", {"claim_id": self.claim_id, "outcome": "done"})
+        self.state = "idle"
+
     async def start(self, system_prompt: str, resume: str | None = None) -> None:
         self.session_id = resume or f"scripted-{self.worker}"
 
@@ -119,6 +129,13 @@ class ScriptedAdapter(HarnessAdapter):
     async def _step(self, prompt: str) -> None:
         if "kind=shutdown" in prompt:
             return
+        if not self._adopted:
+            # A restarted runtime re-derives its progress from git; claims made before the restart
+            # are unknown to it, so let them go instead of leaving them to expire.
+            self._adopted = True
+            mine = await self._mcp("claims", {"worker": self.worker})
+            for claim_id in re.findall(r"claim#(\d+)", mine):
+                await self._mcp("release_claim", {"claim_id": int(claim_id), "outcome": "abandoned", "note": "runtime restarted"})
         if self.state == "idle":
             if self.n >= self.features:
                 await self._mcp("board_read", {"limit": 5})  # done: stay responsive to peers
@@ -141,6 +158,10 @@ class ScriptedAdapter(HarnessAdapter):
             remote = self._git("ls-remote", "--exit-code", "--heads", "origin", self.branch, check=False)
             if remote.returncode == 0:
                 self._git("fetch", "origin", self.branch)
+                landed = self._git("merge-base", "--is-ancestor", f"origin/{self.branch}", f"origin/{self.main}", check=False)
+                if landed.returncode == 0:  # a relaunched runtime redoing a feature that already landed
+                    await self._finish_feature(f"already on {self.main}")
+                    return
                 self._git("checkout", "-B", self.branch, f"origin/{self.branch}")
             else:
                 self._git("checkout", "-B", self.branch, f"origin/{self.main}")
@@ -163,14 +184,8 @@ class ScriptedAdapter(HarnessAdapter):
             status = await self._mcp("merge_status", {})
             mine = re.search(rf"PR #{self.pr}: (\w+)", status)
             st = mine.group(1) if mine else ""
-            if st == "merged":
-                await self._mcp(
-                    "board_write",
-                    {"type": "PATCH_SUMMARY", "text": f"files=features/{self.worker}_{self.n}.py,{REGISTRY} | idea=feature {self.n} | evidence=merged PR #{self.pr}"},
-                )
-                if self.claim_id:
-                    await self._mcp("release_claim", {"claim_id": self.claim_id, "outcome": "done"})
-                self.state = "idle"
+            if st in ("merged", "cancelled"):  # cancelled: nothing to land, it is already on main
+                await self._finish_feature(f"{st} PR #{self.pr}")
             elif st in ("conflict", "failed"):
                 self._git("fetch", "origin", self.main)
                 merged = self._git("merge", "--no-edit", f"origin/{self.main}", check=False)

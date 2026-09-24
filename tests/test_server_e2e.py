@@ -150,3 +150,24 @@ async def test_idle_backoff_and_reset(server, tmp_path):
         assert "wake up" in fake.prompts[-1] and rt.idle_streak == 0
     finally:
         await coord.close()
+
+
+async def test_replacement_sandbox_gets_a_handoff(server, tmp_path):
+    """A runtime with no local state (its sandbox was replaced) learns its live claims."""
+    tokens = await register(server, "w1", "w2")
+    async with server.mcp(tokens["w1"]) as w1:
+        await w1.call_tool("claim", {"scope": ["src/parser.py"], "intent": "parser rewrite"})
+
+    async def first_prompt(worker: str) -> str:
+        fake = FakeAdapter()
+        coord = CoordClient(server.url, tokens[worker])
+        runtime = WorkerRuntime(worker, coord, fake, "sys", "[card]", str(tmp_path / worker), continue_after_s=0.1)
+        try:
+            await runtime.run(max_turns=1)
+        finally:
+            await coord.close()
+        return fake.prompts[0]
+
+    replaced = await first_prompt("w1")
+    assert "Handoff from your previous session" in replaced and "src/parser.py" in replaced
+    assert "Handoff" not in await first_prompt("w2")  # a genuinely new worker has nothing to hand off

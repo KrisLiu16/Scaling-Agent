@@ -75,7 +75,11 @@ def _meta(k: str, v: str) -> models.MetadataVar:
 class AgsControlPlane:
     def __init__(self, secret_id: str, secret_key: str, region: str, endpoint: str = "ags.tencentcloudapi.com") -> None:
         cred = credential.Credential(secret_id, secret_key)
-        profile = ClientProfile(httpProfile=HttpProfile(endpoint=endpoint, reqTimeout=30), retryer=StandardRetryer(max_attempts=3))
+        protocol = "https"
+        if "://" in endpoint:  # e.g. http://mock-ags:9000 for the local stand-in
+            protocol, endpoint = endpoint.split("://", 1)
+        http = HttpProfile(protocol=protocol, endpoint=endpoint.rstrip("/"), reqTimeout=30)
+        profile = ClientProfile(httpProfile=http, retryer=StandardRetryer(max_attempts=3))
         self.region = region
         self.c = ags_client.AgsClient(cred, region, profile)
 

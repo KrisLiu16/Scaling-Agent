@@ -514,7 +514,7 @@ def build_app(settings: CoordSettings) -> Starlette:
             + ["Your recent board notes:"] + [f"- {e.render()}" for e in own]
             + ["Your merge requests:"] + [f"- PR #{r.pr_number}: {r.status.value} {r.detail or ''}" for r in reqs]
         )
-        return JSONResponse({"text": text})
+        return JSONResponse({"text": text, "empty": not (claims or own or reqs)})
 
     async def ingest_trace(request: Request) -> Response:
         worker = await worker_from(request)

@@ -137,6 +137,8 @@ class MergeQueue:
         retry_delay_s: float = 2.0,
         allow_foreign_submissions: bool = False,
         conflicts: GitConflictChecker | None = None,
+        defer_s: float = 30.0,
+        max_deferrals: int = 3,
     ) -> None:
         self.store = store
         self.gitea = gitea
@@ -151,22 +153,31 @@ class MergeQueue:
         self.conflicts = conflicts
         self._backoff = 2.0
         self._wake = asyncio.Event()
+        # A clean PR that Gitea still refuses to merge steps aside (request id -> (not before, count))
+        # so it cannot hold up the queue, and fails after `max_deferrals` rounds instead of forever.
+        self.defer_s = defer_s
+        self.max_deferrals = max_deferrals
+        self._deferred: dict[int, tuple[float, int]] = {}
 
     def poke(self) -> None:
         self._wake.set()
 
     async def run(self, stop: asyncio.Event) -> None:
         while not stop.is_set():
-            req = await self.store.merge_next()
+            now = time.time()
+            waiting = {rid: t for rid, (t, _) in self._deferred.items() if t > now}
+            req = await self.store.merge_next(skip=waiting)
             if req is None:
                 self._wake.clear()
                 try:
-                    await asyncio.wait_for(self._wake.wait(), self.poll_s)
+                    await asyncio.wait_for(self._wake.wait(), min([self.poll_s, *(t - now for t in waiting.values())]))
                 except TimeoutError:
                     pass
                 continue
             try:
-                await self.process(req)
+                done = await self.process(req)
+                if done.status is not MergeStatus.QUEUED:
+                    self._deferred.pop(req.id, None)
             except (httpx.TransportError, GiteaError) as exc:
                 if isinstance(exc, GiteaError) and exc.status < 500:
                     await self._fail_safely(req, exc)
@@ -186,6 +197,7 @@ class MergeQueue:
 
     async def _fail_safely(self, req: MergeRequest, exc: Exception) -> None:
         log.error("merge queue failed on PR #%s", req.pr_number, exc_info=exc)
+        self._deferred.pop(req.id, None)
         try:
             await self._bounce(req, MergeStatus.FAILED, f"merge queue error: {exc}")
         except Exception:  # e.g. the store itself failed: the request is re-queued on restart
@@ -219,6 +231,8 @@ class MergeQueue:
                 return await self._bounce(
                     req, MergeStatus.CONFLICT, f"PR #{pr.number} head moved while queued; push and resubmit.", pr.head_sha
                 )
+            if report.already_on_main:
+                return await self._nothing_to_land(req, pr)
             if not report.clean:
                 await self.store.record_file_heat(report.files or files, conflicted=True)
                 return await self._bounce(
@@ -229,6 +243,8 @@ class MergeQueue:
                     "then call merge_request again.",
                     pr.head_sha,
                 )
+        elif not files:
+            return await self._nothing_to_land(req, pr)
         else:
             # Without a local mirror, fall back to Gitea's asynchronous `mergeable` flag. It reads
             # false while Gitea re-checks PRs after every push to main, so back off before believing it.
@@ -276,9 +292,21 @@ class MergeQueue:
                     await asyncio.sleep(self.retry_delay_s * (2 ** attempt))
                     continue
                 if known_clean and not head_moved:
-                    # Clean per git, but Gitea is still busy: back of the queue, not the author's problem.
-                    return await self.store.merge_update(
-                        req.id, MergeStatus.QUEUED, "gitea still checking mergeability; retrying", pr.head_sha
+                    # Clean per git, but Gitea still refuses (usually: still re-checking after main
+                    # moved). Step aside and retry later; a refusal that persists is reported.
+                    _, count = self._deferred.get(req.id, (0.0, 0))
+                    if count < self.max_deferrals:
+                        self._deferred[req.id] = (time.time() + self.defer_s * 2**count, count + 1)
+                        return await self.store.merge_update(
+                            req.id, MergeStatus.QUEUED, f"gitea refused the merge ({e}); retrying later", pr.head_sha
+                        )
+                    self._deferred.pop(req.id, None)
+                    return await self._bounce(
+                        req,
+                        MergeStatus.FAILED,
+                        f"PR #{pr.number} merges cleanly with {self.main}, but Gitea keeps refusing to merge it ({e}). "
+                        "Check the PR on Gitea (title, branch, permissions); push a fix and resubmit, or ask on the channel.",
+                        pr.head_sha,
                     )
                 return await self._bounce(
                     req,
@@ -302,6 +330,15 @@ class MergeQueue:
             ),
         )
         return done
+
+    async def _nothing_to_land(self, req: MergeRequest, pr: PullRequest) -> MergeRequest:
+        return await self._bounce(
+            req,
+            MergeStatus.CANCELLED,
+            f"PR #{pr.number} has nothing to land: {pr.head_ref} is already contained in {self.main} "
+            "(it landed through another PR). Close the PR; if that work is done, release its claim.",
+            pr.head_sha,
+        )
 
     async def _bounce(
         self, req: MergeRequest, status: MergeStatus, reason: str, head_sha: str | None = None

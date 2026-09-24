@@ -5,11 +5,17 @@
 #   docker build -f deploy/Dockerfile --target worker     -t sa-worker:dev .
 #   docker buildx build -f deploy/Dockerfile --target worker-ags --platform linux/amd64 \
 #     -t sgccr.ccs.tencentyun.com/<ns>/sa-worker:v1 --push .     # AGS: adds envd
+#   docker build -f deploy/Dockerfile --target worker-ags --build-arg ENVD_IMAGE=sa-envd:dev \
+#     -t sa-worker-ags:dev .                                     # local mock AGS
+# The mock AGS (scaling-agent mock-ags serve) runs from the launcher image.
 # Gitea uses the upstream gitea/gitea image.
 
 # The full (non-slim) Python image already ships git, curl and a C toolchain, which the worker
 # and the merge-queue verifier need; no package-manager step, so builds work behind strict egress.
 ARG PYTHON_IMAGE=python:3.11-bookworm
+# Where worker-ags gets envd: AGS's published image, or sa-envd:dev from deploy/envd/build.sh
+# (E2B's open-source envd, for the local mock AGS).
+ARG ENVD_IMAGE=ccr.ccs.tencentyun.com/ags-image/envd:v0.5.14
 
 FROM ${PYTHON_IMAGE} AS base
 RUN git --version
@@ -44,7 +50,7 @@ CMD ["scaling-agent", "worker", "run"]
 
 # Worker for Tencent Cloud AGS: AGS needs envd in the image and ignores CMD/ENTRYPOINT
 # (the sandbox tool's Command/Args start envd; the launcher starts the runtime through envd).
-FROM ccr.ccs.tencentyun.com/ags-image/envd:v0.5.14 AS envd
+FROM ${ENVD_IMAGE} AS envd
 FROM worker AS worker-ags
 COPY --from=envd /usr/bin/envd /usr/bin/envd
 RUN chmod 0755 /usr/bin/envd

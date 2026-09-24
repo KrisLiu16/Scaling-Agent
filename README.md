@@ -18,6 +18,7 @@ Scaling-Agent 是一个多 Agent 协作框架：N 个完全对等的 agent 用�
 | status | `scaling-agent status` | 查看组织的 KPI |
 
 沙箱后端：`ags`（腾讯云常驻沙箱，见 [docs/AGS.md](docs/AGS.md)）、`k8s`（用 Pod 模拟）、`local`（本机子进程）。
+没有云账号时，`scaling-agent mock-ags serve` 在本地模拟 AGS 的控制面和 E2B 数据面，沙箱里跑真实的 envd，`ags` 后端的代码路径可以原样跑通。
 
 ## 快速开始
 
@@ -28,6 +29,9 @@ uv venv && uv pip install -e ".[worker,ags,k8s,dev]" && .venv/bin/pytest
 # 本机 K8s 集群：四个镜像 + Gitea + coord + launcher Job，用 scripted worker 验证整套流程
 deploy/k8s/build.sh && deploy/k8s/up.sh
 kubectl -n scaling-agent exec deploy/coord -- scaling-agent status
+
+# 同样的 run，但走 AGS 代码路径：本地 mock AGS + 真实 envd 的沙箱
+deploy/envd/build.sh && deploy/k8s/build.sh && deploy/k8s/up.sh deploy/k8s/run.mock-ags.yaml
 ```
 
 ## 目录
@@ -38,9 +42,10 @@ src/scaling_agent/
   workspace/    Gitea 客户端、webhook 路由、合并队列
   runtime/      worker 事件循环、harness 适配器（claude_code / scripted / fake）
   sandbox/      ags / k8s / local
+  mock_ags/     本地模拟的 AGS（Cloud API v3 + envd 网关，沙箱是 Pod）
   prompts/      worker prompt、协议卡
   launcher.py   启动与监督
-deploy/         Dockerfile（coord / launcher / worker / worker-ags）、Gitea 镜像、k8s 清单、compose
+deploy/         Dockerfile（coord / launcher / worker / worker-ags）、Gitea 镜像、envd 构建、k8s 清单、compose
 scripts/        ags_probe.py（验证 AGS 行为）
 docs/           设计、AGS、本地 K8s 记录
 ```

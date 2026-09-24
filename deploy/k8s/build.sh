@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the four images offline: dependencies come from a host-side wheelhouse and Gitea from its
+# Build the images offline: dependencies come from a host-side wheelhouse and Gitea from its
 # release binary, so the builds need neither package mirrors nor Docker Hub beyond the base image.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
@@ -29,4 +29,11 @@ for target in coord launcher worker; do
     -f deploy/Dockerfile --target "$target" -t "sa-$target:dev" .
 done
 docker build -q --build-arg BASE_IMAGE="$LOCAL_BASE" -f deploy/gitea/Dockerfile -t sa-gitea:dev deploy/gitea
+
+# AGS-style worker image for the mock AGS (needs envd: deploy/envd/build.sh, which needs Go).
+if [ -x deploy/envd/envd ] || [ -n "${WITH_ENVD:-}" ]; then
+  deploy/envd/build.sh
+  docker build -q --build-arg PYTHON_IMAGE="$LOCAL_BASE" --build-arg PIP_NO_INDEX=1 --build-arg ENVD_IMAGE=sa-envd:dev \
+    -f deploy/Dockerfile --target worker-ags -t sa-worker-ags:dev .
+fi
 docker images --format '{{.Repository}}:{{.Tag}}  {{.Size}}' | grep '^sa-'

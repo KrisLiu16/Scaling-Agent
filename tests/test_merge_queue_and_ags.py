@@ -190,3 +190,71 @@ async def test_git_conflict_checker_finds_exact_conflicts(tmp_path):
     assert clean.clean
     moved = await checker.check(2, "0" * 40)
     assert not moved.head_found
+    # A PR whose head is already in main (it landed through another PR): nothing to merge.
+    base = _git(work, "rev-parse", "HEAD~1")
+    _git(work, "push", "-q", "origin", f"{base}:refs/pull/3/head")
+    landed = await checker.check(3, base)
+    assert landed.clean and landed.already_on_main and not clean.already_on_main
+
+
+class FakeChecker:
+    def __init__(self, **report) -> None:
+        self.report = report
+
+    async def check(self, pr_number, head_sha):
+        from scaling_agent.workspace.conflicts import ConflictReport
+
+        return ConflictReport(**{"clean": True, **self.report})
+
+
+async def test_pr_already_on_main_is_cancelled_not_retried(store):
+    gitea = FakeGitea({9: pr(9)}, merge_error=405)  # Gitea refuses empty merges with 405
+    await store.merge_submit("w1", 9)
+    queue = MergeQueue(store, gitea, "org", "repo", retry_delay_s=0, conflicts=FakeChecker(already_on_main=True))
+    done = await queue.process(await store.merge_next())
+    assert done.status is MergeStatus.CANCELLED and "already contained in main" in done.detail
+    events, _, _ = await store.drain_high("w1")
+    assert events[0].kind == "merge_cancelled"
+
+    class EmptyPrGitea(FakeGitea):  # without a mirror: an empty diff means the same
+        async def pr_files(self, owner, repo, number):
+            return []
+
+    await store.merge_submit("w1", 10)
+    done = await MergeQueue(store, EmptyPrGitea({10: pr(10)}), "org", "repo", retry_delay_s=0).process(await store.merge_next())
+    assert done.status is MergeStatus.CANCELLED
+
+
+async def test_refused_clean_merge_steps_aside_then_fails(store):
+    import asyncio
+
+    class PickyGitea(FakeGitea):
+        async def merge_pr(self, owner, repo, number, head_sha, title=None):
+            if number == 11:
+                raise GiteaError(405, "User not allowed to merge PR")
+            self.merged.append((number, head_sha))
+
+    gitea = PickyGitea({11: pr(11), 12: pr(12)})
+    queue = MergeQueue(store, gitea, "org", "repo", retry_delay_s=0, mergeable_retries=1,
+                       conflicts=FakeChecker(), defer_s=60, poll_s=0.05)
+    await store.merge_submit("w1", 11)
+    await store.merge_submit("w1", 12)
+    stop = asyncio.Event()
+    task = asyncio.create_task(queue.run(stop))
+    for _ in range(100):
+        if gitea.merged:
+            break
+        await asyncio.sleep(0.02)
+    stop.set()
+    queue.poke()
+    await task
+    assert gitea.merged == [(12, "sha12")]  # PR 11 stepped aside instead of blocking the queue
+    first = next(r for r in await store.merge_requests("w1") if r.pr_number == 11)
+    assert first.status is MergeStatus.QUEUED and "refused" in first.detail
+
+    # Deferred rounds are capped: the author gets Gitea's reason instead of an endless retry.
+    queue.defer_s = 0
+    for _ in range(queue.max_deferrals):
+        req = await store.merge_next()
+        done = await queue.process(req)
+    assert done.status is MergeStatus.FAILED and "User not allowed" in done.detail

@@ -121,10 +121,12 @@ class WorkerRuntime:
             self.state.sessions += 1
             self.state.save(self.state_path)
 
-    async def _queue_handoff(self) -> None:
+    async def _queue_handoff(self, skip_if_empty: bool = False) -> None:
         try:
-            self._pending_extra.insert(0, await self.coord.handoff())
-            self._handoff_pending = True
+            text = await self.coord.handoff(skip_if_empty=skip_if_empty)
+            if text:
+                self._pending_extra.insert(0, text)
+                self._handoff_pending = True
         except Exception:
             log.warning("handoff unavailable", exc_info=True)
 
@@ -146,7 +148,13 @@ class WorkerRuntime:
             while not self._stop.is_set() and (max_turns is None or turns < max_turns):
                 try:
                     if not opened:
-                        await self._open_session(fresh=self.state.session_id is None)
+                        fresh = self.state.session_id is None
+                        await self._open_session(fresh=fresh)
+                        if fresh:
+                            # No local state: a first start, or a replacement sandbox (the old one
+                            # died with its disk). The organization may still hold this worker's
+                            # claims and merge requests; hand them to the new session.
+                            await self._queue_handoff(skip_if_empty=True)
                         opened = True
                     await self.step()
                     turns += 1

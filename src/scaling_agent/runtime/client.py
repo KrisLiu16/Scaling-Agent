@@ -57,10 +57,11 @@ class CoordClient:
         data = await self._post("/api/drain", {}, retries=1)
         return data.get("text", "")
 
-    async def handoff(self) -> str:
+    async def handoff(self, skip_if_empty: bool = False) -> str | None:
         resp = await self._http.get("/api/handoff")
         resp.raise_for_status()
-        return resp.json()["text"]
+        data = resp.json()
+        return None if skip_if_empty and data.get("empty") else data["text"]
 
     async def trace(self, records: list[dict[str, Any]]) -> None:
         if records:

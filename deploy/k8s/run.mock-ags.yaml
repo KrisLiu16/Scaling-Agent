@@ -1,0 +1,41 @@
+# The scripted smoke run, provisioned through the AGS provider against the local mock AGS
+# (deploy/k8s/mock-ags.yaml): same launcher code path as Tencent Cloud, sandboxes are pods
+# running E2B's envd (image from deploy/k8s/build.sh with deploy/envd/envd present).
+name: ags-mock-smoke
+task_file: /config/task.md
+workers: 6
+duration_s: 600
+founders: 1
+founding_s: 20
+stagger:
+  - {interval_s: 5}
+max_queue_per_worker: 2.0
+reminders:
+  - {before_end_s: 120, text: "Stop starting new features; land what you have."}
+  - {before_end_s: 30, text: "Merge anything ready, then stop."}
+coord_url: http://coord:8700
+coord_public_url: http://coord:8700
+harness: scripted
+forward_env: [ANTHROPIC_API_KEY]
+worker_env:
+  SA_WORKER_CONTINUE_AFTER_S: "3"
+  SA_SCRIPTED_FEATURES: "3"
+gitea:
+  url: http://gitea:3000
+  public_url: http://gitea:3000
+  owner: agents
+  repo: workspace
+  main_branch: main
+provider:
+  kind: ags
+  endpoint: http://mock-ags:9000
+  data_plane_url: http://mock-ags:9001
+  envd_flags: "-isnotfc -no-cgroups"  # E2B's envd outside Firecracker
+  envd_version: "0.9.0"
+  tool_name: sa-worker-smoke
+  image: sa-worker-ags:dev
+  image_registry_type: custom
+  persistent: true
+  cpu: "1"
+  memory: 1Gi
+  disk: null

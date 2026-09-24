@@ -13,9 +13,11 @@ app = typer.Typer(no_args_is_help=True, help="Self-organized multi-agent harness
 coord_app = typer.Typer(no_args_is_help=True, help="Coordination server.")
 worker_app = typer.Typer(no_args_is_help=True, help="Worker runtime (runs inside a sandbox).")
 ags_app = typer.Typer(no_args_is_help=True, help="Tencent Cloud AGS helpers.")
+mock_ags_app = typer.Typer(no_args_is_help=True, help="Local stand-in for Tencent Cloud AGS (development).")
 app.add_typer(coord_app, name="coord")
 app.add_typer(worker_app, name="worker")
 app.add_typer(ags_app, name="ags")
+app.add_typer(mock_ags_app, name="mock-ags")
 
 
 def _logging(verbose: bool = False) -> None:
@@ -97,6 +99,32 @@ def ags_check(region: str = "ap-singapore", tool_name: str = "sa-worker") -> Non
     typer.echo(json.dumps({"quota(usage,limit)": cp.quota()}, indent=2))
     tool = cp.find_tool(tool_name)
     typer.echo(f"tool {tool_name}: " + (f"{tool.ToolId} status={tool.Status} persistent={tool.Persistent}" if tool else "absent"))
+
+
+@mock_ags_app.command("serve")
+def mock_ags_serve(
+    backend: str = typer.Option("k8s", help="k8s: one pod per sandbox; static: every sandbox is --static-address"),
+    namespace: str = typer.Option("scaling-agent", envvar="SA_MOCK_AGS_NAMESPACE"),
+    static_address: str = typer.Option("http://127.0.0.1:49983", help="envd base URL for the static backend"),
+    host: str = "0.0.0.0",
+    control_port: int = 9000,
+    gateway_port: int = 9001,
+    state_file: str = typer.Option("", envvar="SA_MOCK_AGS_STATE_FILE"),
+    max_instances: int = 200,
+    verbose: bool = False,
+) -> None:
+    """Serve the mock AGS control plane (Cloud API v3) and data-plane gateway (E2B/envd)."""
+    from .mock_ags.backends import PodBackend, StaticBackend
+    from .mock_ags.server import MockAgs, serve
+
+    _logging(verbose)
+    secret_id = os.environ.get("TENCENTCLOUD_SECRET_ID")
+    secret_key = os.environ.get("TENCENTCLOUD_SECRET_KEY")
+    if not secret_id or not secret_key:
+        raise typer.BadParameter("set TENCENTCLOUD_SECRET_ID/TENCENTCLOUD_SECRET_KEY: requests are signature-checked")
+    impl = PodBackend(namespace) if backend == "k8s" else StaticBackend(static_address)
+    ags = MockAgs(impl, secret_id, secret_key, state_file=state_file or None, max_instances=max_instances)
+    asyncio.run(serve(ags, host, control_port, gateway_port))
 
 
 if __name__ == "__main__":

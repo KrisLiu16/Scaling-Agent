@@ -44,3 +44,30 @@ launcher (持有 AK/SK)
 5. 暂停再恢复后，后台进程是否还活着。
 
 在能访问 `*.tencentcloudapi.com` 和 `*.tencentags.com` 的机器上运行即可。当前这个开发容器的网络策略拦截了这两个域名。
+
+## 本地模拟（mock AGS）
+
+没有云账号或网络不通时，用 `scaling-agent mock-ags serve` 在本地模拟 AGS。launcher 走的是和腾讯云完全相同的 `AgsProvider` 代码路径，只把 `provider.endpoint` / `provider.data_plane_url` 指向 mock：
+
+- **控制面**：Cloud API v3（`POST /` + `X-TC-Action`），用配置的 SecretId/SecretKey 校验 TC3-HMAC-SHA256 签名。
+  实现了 launcher 用到的全部 action：Tool 的增删查、实例的启动/查询/续期/暂停/恢复/停止、token 和配额。
+  也按文档复现了会报错的约束：Persistent 只允许 custom、必须有 Probe、`ReadyTimeoutMs ≤ 30000`、enterprise/personal 需要 RoleArn、ClientToken 幂等、配额超限报 `LimitExceeded.SandboxInstance`、超时回收。
+- **数据面**：一个网关按 `E2b-Sandbox-Id` 请求头（或 `{port}-{id}.` 形式的 Host）路由，校验 `X-Access-Token`，再流式转发给实例里的 envd。
+- **沙箱**：每个实例是一个 Pod，按 Tool 的 CustomConfiguration 创建：镜像、Command/Args、Env、端口、指向 envd `/health` 的探针。和 AGS 一样忽略镜像的 CMD。
+  envd 用的是从 [e2b-dev/infra](https://github.com/e2b-dev/infra) 源码编译的真实 envd（`deploy/envd/build.sh`），在 Firecracker 之外运行需要加 `-isnotfc -no-cgroups`。
+
+```sh
+deploy/envd/build.sh                                # 编译 envd（需要 Go），并生成镜像 sa-envd:dev
+deploy/k8s/build.sh                                 # 发现 deploy/envd/envd 时会额外构建 sa-worker-ags:dev
+deploy/k8s/up.sh deploy/k8s/run.mock-ags.yaml       # 自动部署 mock-ags 并生成随机签名密钥
+```
+
+没有 Kubernetes 时可以用 `--backend static --static-address http://127.0.0.1:49983`，把所有实例都指向同一个本地 envd。`tests/test_mock_ags.py` 就是这样测的。
+
+**mock 模拟不了的部分**：
+- microVM 隔离（这里是 Pod 加 NetworkPolicy）；
+- 暂停时的内存快照（这里的暂停只是网关拒绝访问）；
+- AGS 自带的 envd 版本差异（v0.5.14，而本地是 0.9.0；两者都支持 launcher 用到的 process/filesystem RPC）；
+- 真实的配额和计费。
+
+上面"待实测清单"里的项仍然要在真实 AGS 上确认。

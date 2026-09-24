@@ -20,6 +20,9 @@ class ConflictReport:
     clean: bool
     files: list[str] = field(default_factory=list)
     head_found: bool = True
+    # The PR head is already contained in main (e.g. its branch landed through another PR):
+    # nothing to merge, and Gitea refuses such a merge with a 405 that looks transient.
+    already_on_main: bool = False
 
 
 class GitConflictChecker:
@@ -65,6 +68,9 @@ class GitConflictChecker:
                 await asyncio.sleep(0.3 * (attempt + 1))
             else:
                 return ConflictReport(clean=False, head_found=False)
+            code, _ = await self._git("merge-base", "--is-ancestor", head_sha, f"refs/heads/{self._main}")
+            if code == 0:
+                return ConflictReport(clean=True, already_on_main=True)
             code, out = await self._git(
                 "merge-tree", "--write-tree", "--name-only", "--no-messages", f"refs/heads/{self._main}", head_sha
             )
