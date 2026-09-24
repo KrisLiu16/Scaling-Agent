@@ -17,18 +17,21 @@ Delivery semantics (see docs/DESIGN.md, "事件投递"):
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
+import os
 import secrets
 import time
 import uuid
-from collections.abc import Iterable
+from collections.abc import AsyncIterator, Callable, Iterable
 from typing import Any, Literal
 
 import aiosqlite
 
 from ..protocol import (
     BOARD_READ_LIMIT,
+    one_line,
     BoardEntry,
     BoardType,
     Claim,
@@ -146,6 +149,7 @@ CREATE INDEX IF NOT EXISTS trace_kind ON trace(kind, id);
 
 MAIN_CHANNEL = "main"
 SYSTEM = "system"
+CONTROL_KINDS = ("shutdown",)
 ACTIVE_MERGE_STATES = (MergeStatus.QUEUED.value, MergeStatus.TESTING.value)
 
 
@@ -164,10 +168,17 @@ class Store:
         # aiosqlite runs statements on one thread, but multi-statement operations
         # (read cursor -> select -> advance cursor) must not interleave.
         self._lock = asyncio.Lock()
+        self._wakes: set[str] = set()
         self.claim_ttl_s = claim_ttl_s
         self.hot_file_threshold = hot_file_threshold
+        # Called with a worker id after a transaction that queued an event for it (long-poll wakeup).
+        self.on_enqueue: Callable[[str], None] | None = None
 
     async def open(self) -> None:
+        if self._path != ":memory:":
+            # Tokens (bot token, webhook secret) live in this file: owner-only.
+            os.close(os.open(self._path, os.O_CREAT | os.O_RDWR, 0o600))
+            os.chmod(self._path, 0o600)
         self._db = await aiosqlite.connect(self._path)
         self._db.row_factory = aiosqlite.Row
         await self._db.executescript(SCHEMA)
@@ -184,6 +195,26 @@ class Store:
             raise RuntimeError("store is not open")
         return self._db
 
+    @contextlib.asynccontextmanager
+    async def _tx(self) -> AsyncIterator[None]:
+        """Serialize a multi-statement write and make it atomic: commit on success, roll back on error.
+
+        One shared connection means a failed request must not leave half-written rows for the next
+        writer's commit to publish.
+        """
+        async with self._lock:
+            self._wakes = set()
+            try:
+                yield
+                await self.db.commit()
+            except BaseException:
+                await self.db.rollback()
+                raise
+            wakes, self._wakes = self._wakes, set()
+        if self.on_enqueue is not None:
+            for worker in wakes:
+                self.on_enqueue(worker)
+
     async def _fetchall(self, sql: str, params: Iterable[Any] = ()) -> list[aiosqlite.Row]:
         async with self.db.execute(sql, tuple(params)) as cur:
             return list(await cur.fetchall())
@@ -197,13 +228,12 @@ class Store:
     async def register_worker(self, worker: str, token: str | None = None) -> str:
         """Create a worker (or rotate its token). Returns the plaintext token."""
         token = token or secrets.token_urlsafe(32)
-        async with self._lock:
+        async with self._tx():
             await self.db.execute(
                 "INSERT INTO workers(id, token_sha256, created_at) VALUES (?, ?, ?) "
                 "ON CONFLICT(id) DO UPDATE SET token_sha256=excluded.token_sha256",
                 (worker, hash_token(token), time.time()),
             )
-            await self.db.commit()
         return token
 
     async def authenticate(self, token: str) -> str | None:
@@ -216,7 +246,7 @@ class Store:
     async def touch(self, worker: str, state: str | None = None, renew_claims: bool = True) -> None:
         """Record liveness. Any activity renews the worker's claims, so dead workers' claims expire."""
         now = time.time()
-        async with self._lock:
+        async with self._tx():
             if state:
                 await self.db.execute("UPDATE workers SET last_seen=?, state=? WHERE id=?", (now, state, worker))
             else:
@@ -227,7 +257,6 @@ class Store:
                     "WHERE worker=? AND released_at IS NULL AND expires_at>?",
                     (now + self.claim_ttl_s, worker, now),
                 )
-            await self.db.commit()
 
     # ------------------------------------------------------------------- claims
 
@@ -276,7 +305,7 @@ class Store:
             raise ValidationError("intent must not be empty")
         now = time.time()
         ttl = ttl_s if ttl_s is not None else self.claim_ttl_s
-        async with self._lock:
+        async with self._tx():
             live = [
                 self._claim_row(r)
                 for r in await self._fetchall(
@@ -315,12 +344,11 @@ class Store:
                         payload={"claim_id": claim.id, "your_claim_id": other.id, "claimant": worker},
                     ),
                 )
-            await self.db.commit()
         return ClaimResult(claim=claim, conflicts=conflicts, hotspots=hot)
 
     async def release_claim(self, worker: str, claim_id: int, outcome: str, note: str | None = None) -> Claim:
         now = time.time()
-        async with self._lock:
+        async with self._tx():
             row = await self._fetchone("SELECT * FROM claims WHERE id=? AND worker=?", (claim_id, worker))
             if row is None:
                 raise ValidationError(f"claim#{claim_id} is not yours")
@@ -328,7 +356,6 @@ class Store:
                 "UPDATE claims SET released_at=?, outcome=? WHERE id=? AND released_at IS NULL",
                 (now, outcome if not note else f"{outcome}: {note}", claim_id),
             )
-            await self.db.commit()
             row = await self._fetchone("SELECT * FROM claims WHERE id=?", (claim_id,))
         return self._claim_row(row)
 
@@ -353,13 +380,12 @@ class Store:
         # Entries inherit the author's current claim scope so relevance routing works without extra effort.
         norm = scopes.normalize(scope) if scope else await self.interest_scope(agent)
         now = time.time()
-        async with self._lock:
+        async with self._tx():
             cur = await self.db.execute(
                 "INSERT INTO board(ts, agent, type, text, detail, scope) VALUES (?, ?, ?, ?, ?, ?)",
                 (now, agent, entry_type.value, text, detail or None, json.dumps(norm)),
             )
             await self.db.execute("UPDATE workers SET last_board_write=? WHERE id=?", (now, agent))
-            await self.db.commit()
         return BoardEntry(
             id=cur.lastrowid, ts=now, agent=agent, type=entry_type, text=text, has_detail=bool(detail), scope=norm
         )
@@ -436,25 +462,24 @@ class Store:
     # ----------------------------------------------------------------- messages
 
     async def post_channel(self, sender: str, text: str, channel: str = MAIN_CHANNEL) -> Message:
-        text = text.strip()
+        text = one_line(text)
         if not text:
             raise ValidationError("text must not be empty")
         now = time.time()
-        async with self._lock:
+        async with self._tx():
             cur = await self.db.execute(
                 "INSERT INTO messages(ts, sender, channel, text) VALUES (?, ?, ?, ?)", (now, sender, channel, text)
             )
-            await self.db.commit()
         return Message(id=cur.lastrowid, ts=now, sender=sender, channel=channel, text=text)
 
     async def send_dm(self, sender: str, recipient: str, text: str) -> Message:
-        text = text.strip()
+        text = one_line(text)
         if not text:
             raise ValidationError("text must not be empty")
         if recipient == sender:
             raise ValidationError("cannot send a direct message to yourself")
         now = time.time()
-        async with self._lock:
+        async with self._tx():
             if await self._fetchone("SELECT 1 FROM workers WHERE id=?", (recipient,)) is None:
                 raise ValidationError(f"unknown worker {recipient!r}")
             cur = await self.db.execute(
@@ -473,7 +498,6 @@ class Store:
                     payload={"message_id": msg.id, "sender": sender},
                 ),
             )
-            await self.db.commit()
         return msg
 
     async def message_history(
@@ -512,21 +536,21 @@ class Store:
                 json.dumps(event.payload, ensure_ascii=False),
             ),
         )
+        if cur.rowcount > 0:
+            self._wakes.add(worker)
         return cur.rowcount > 0
 
     async def enqueue(self, worker: str, event: Event) -> bool:
         """Queue an event for one worker. Returns False for a duplicate `event_id` (dedupe)."""
-        async with self._lock:
+        async with self._tx():
             inserted = await self._enqueue_locked(worker, event)
-            await self.db.commit()
         return inserted
 
     async def enqueue_many(self, targets: Iterable[tuple[str, Event]]) -> int:
         n = 0
-        async with self._lock:
+        async with self._tx():
             for worker, event in targets:
                 n += await self._enqueue_locked(worker, event)
-            await self.db.commit()
         return n
 
     @staticmethod
@@ -572,7 +596,7 @@ class Store:
         lease_id = uuid.uuid4().hex
         now = time.time()
         interest = await self.interest_scope(worker)
-        async with self._lock:
+        async with self._tx():
             row = await self._fetchone(
                 "SELECT board_cursor, board_hot_cursor, channel_cursor FROM workers WHERE id=?", (worker,)
             )
@@ -621,7 +645,6 @@ class Store:
                 (max(board_cursor, head_id), max(hot_cursor, head_id), new_channel_cursor, now, worker),
             )
             await self.db.execute("INSERT INTO leases(lease_id, worker, created_at) VALUES (?, ?, ?)", (lease_id, worker, now))
-            await self.db.commit()
 
         snapshot = await self.board_read(limit=recent_board) if recent_board > 0 else []
         if interest and recent_board > 0:
@@ -641,22 +664,31 @@ class Store:
             recent_board=snapshot,
         )
 
-    async def ack(self, worker: str, lease_id: str) -> float | None:
-        """Mark a lease's events delivered. Returns the lease start time (None if unknown or foreign)."""
+    async def ack(self, worker: str, lease_id: str, redeliver: bool = False) -> float | None:
+        """Close a lease. Returns the lease start time (None if unknown or foreign).
+
+        Normally the lease's events become delivered. With `redeliver=True` (the harness crashed or
+        timed out before consuming the prompt) they are released and go into the next batch again.
+        """
         now = time.time()
-        async with self._lock:
+        async with self._tx():
             row = await self._fetchone(
                 "SELECT created_at, acked_at FROM leases WHERE lease_id=? AND worker=?", (lease_id, worker)
             )
             if row is None:
                 return None
             if row["acked_at"] is None:
-                await self.db.execute(
-                    "UPDATE events SET delivered_at=? WHERE lease_id=? AND worker=? AND delivered_at IS NULL",
-                    (now, lease_id, worker),
-                )
+                if redeliver:
+                    await self.db.execute(
+                        "UPDATE events SET lease_id=NULL WHERE lease_id=? AND worker=? AND delivered_at IS NULL",
+                        (lease_id, worker),
+                    )
+                else:
+                    await self.db.execute(
+                        "UPDATE events SET delivered_at=? WHERE lease_id=? AND worker=? AND delivered_at IS NULL",
+                        (now, lease_id, worker),
+                    )
                 await self.db.execute("UPDATE leases SET acked_at=? WHERE lease_id=?", (now, lease_id))
-                await self.db.commit()
             return row["created_at"]
 
     async def drain_high(
@@ -668,10 +700,13 @@ class Store:
         """
         now = time.time()
         interest = await self.interest_scope(worker)
-        async with self._lock:
+        async with self._tx():
+            # Skip events already leased into the current turn's prompt, and control events that the
+            # runtime itself must see in a turn batch (shutdown).
             event_rows = await self._fetchall(
-                "SELECT * FROM events WHERE worker=? AND delivered_at IS NULL AND priority>=? ORDER BY seq",
-                (worker, int(Priority.HIGH)),
+                "SELECT * FROM events WHERE worker=? AND delivered_at IS NULL AND lease_id IS NULL "
+                f"AND priority>=? AND kind NOT IN ({','.join('?' * len(CONTROL_KINDS))}) ORDER BY seq",
+                (worker, int(Priority.HIGH), *CONTROL_KINDS),
             )
             if event_rows:
                 await self.db.execute(
@@ -692,7 +727,6 @@ class Store:
                 "UPDATE workers SET board_hot_cursor=?, last_seen=? WHERE id=?",
                 (max(hot_cursor, head["m"] or 0), now, worker),
             )
-            await self.db.commit()
         return [self._event_row(r) for r in event_rows], shown, len(candidates) - len(shown)
 
     # -------------------------------------------------------------- merge queue
@@ -713,7 +747,7 @@ class Store:
     async def merge_submit(self, worker: str, pr_number: int) -> tuple[MergeRequest, int]:
         """Queue a PR for landing. Idempotent per PR while it is still queued. Returns (request, position)."""
         now = time.time()
-        async with self._lock:
+        async with self._tx():
             row = await self._fetchone(
                 f"SELECT * FROM merge_queue WHERE pr_number=? AND status IN ({','.join('?' * len(ACTIVE_MERGE_STATES))})",
                 (pr_number, *ACTIVE_MERGE_STATES),
@@ -723,7 +757,6 @@ class Store:
                     "INSERT INTO merge_queue(pr_number, worker, status, enqueued_at, updated_at) VALUES (?, ?, ?, ?, ?)",
                     (pr_number, worker, MergeStatus.QUEUED.value, now, now),
                 )
-                await self.db.commit()
                 row = await self._fetchone("SELECT * FROM merge_queue WHERE id=?", (cur.lastrowid,))
             pos = await self._fetchone(
                 f"SELECT count(*) AS n FROM merge_queue WHERE id<=? AND status IN ({','.join('?' * len(ACTIVE_MERGE_STATES))})",
@@ -731,9 +764,18 @@ class Store:
             )
         return self._merge_row(row), pos["n"]
 
+    async def reset_inflight_merges(self) -> int:
+        """At startup: requests left in TESTING by a crash or restart go back to the queue."""
+        async with self._tx():
+            cur = await self.db.execute(
+                "UPDATE merge_queue SET status=?, updated_at=? WHERE status=?",
+                (MergeStatus.QUEUED.value, time.time(), MergeStatus.TESTING.value),
+            )
+        return cur.rowcount
+
     async def merge_next(self) -> MergeRequest | None:
         """Claim the oldest queued request for processing (single consumer)."""
-        async with self._lock:
+        async with self._tx():
             row = await self._fetchone(
                 "SELECT * FROM merge_queue WHERE status=? ORDER BY id LIMIT 1", (MergeStatus.QUEUED.value,)
             )
@@ -742,19 +784,17 @@ class Store:
             await self.db.execute(
                 "UPDATE merge_queue SET status=?, updated_at=? WHERE id=?", (MergeStatus.TESTING.value, time.time(), row["id"])
             )
-            await self.db.commit()
             row = await self._fetchone("SELECT * FROM merge_queue WHERE id=?", (row["id"],))
         return self._merge_row(row)
 
     async def merge_update(
         self, request_id: int, status: MergeStatus, detail: str | None = None, head_sha: str | None = None
     ) -> MergeRequest:
-        async with self._lock:
+        async with self._tx():
             await self.db.execute(
                 "UPDATE merge_queue SET status=?, detail=?, head_sha=coalesce(?, head_sha), updated_at=? WHERE id=?",
                 (status.value, detail, head_sha, time.time(), request_id),
             )
-            await self.db.commit()
             row = await self._fetchone("SELECT * FROM merge_queue WHERE id=?", (request_id,))
         return self._merge_row(row)
 
@@ -781,7 +821,7 @@ class Store:
 
     async def record_file_heat(self, paths: Iterable[str], merged: bool = False, conflicted: bool = False) -> None:
         now = time.time()
-        async with self._lock:
+        async with self._tx():
             for path in {scopes.normalize_item(p) for p in paths}:
                 await self.db.execute(
                     "INSERT INTO file_heat(path, merges, conflicts, last_touched) VALUES (?, ?, ?, ?) "
@@ -789,7 +829,6 @@ class Store:
                     "conflicts=conflicts+excluded.conflicts, last_touched=excluded.last_touched",
                     (path, int(merged), int(conflicted), now),
                 )
-            await self.db.commit()
 
     async def hotspots(self, limit: int = 20) -> list[dict[str, Any]]:
         """Files that many live claims or recent merges/conflicts touch: the organization's conflict magnets."""
@@ -814,12 +853,11 @@ class Store:
     # ----------------------------------------------------------------------- kv
 
     async def kv_set(self, key: str, value: Any) -> None:
-        async with self._lock:
+        async with self._tx():
             await self.db.execute(
                 "INSERT INTO kv(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 (key, json.dumps(value, ensure_ascii=False)),
             )
-            await self.db.commit()
 
     async def kv_get(self, key: str, default: Any = None) -> Any:
         row = await self._fetchone("SELECT value FROM kv WHERE key=?", (key,))
@@ -828,16 +866,15 @@ class Store:
     # -------------------------------------------------------------------- trace
 
     async def trace(self, worker: str | None, kind: str, data: dict[str, Any] | None = None) -> None:
-        async with self._lock:
+        async with self._tx():
             await self.db.execute(
                 "INSERT INTO trace(ts, worker, kind, data) VALUES (?, ?, ?, ?)",
                 (time.time(), worker, kind, json.dumps(data or {}, ensure_ascii=False, default=str)),
             )
-            await self.db.commit()
 
     async def trace_many(self, worker: str | None, records: Iterable[dict[str, Any]]) -> int:
         n = 0
-        async with self._lock:
+        async with self._tx():
             for rec in records:
                 await self.db.execute(
                     "INSERT INTO trace(ts, worker, kind, data) VALUES (?, ?, ?, ?)",
@@ -849,7 +886,6 @@ class Store:
                     ),
                 )
                 n += 1
-            await self.db.commit()
         return n
 
     async def status(self) -> dict[str, Any]:

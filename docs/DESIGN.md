@@ -66,24 +66,29 @@ Agensh 的问题主要来自论文本身和它公开的 1,024 agent 回放数据
 | 问题 | Agensh 的做法 | 本项目的做法 | 代码 |
 |---|---|---|---|
 | 认领撞车 | CLAIM 是自由文本，靠读到的人自己发现 | 结构化 scope + 租约（活跃即续期，worker 死了自动过期）；写入时由服务端检测重叠，双方收 HIGH 事件；可选 `exclusive` | `coord/store.py: claim` `coord/scope.py` |
-| 75% 的 PR 没合入，后期合并跟不上 | 各自 self-merge，冲突自己处理 | 合并队列串行落地，可选用合并后的结果做验证；冲突精确退回作者；队列积压时反压，暂停扩容 | `workspace/merge_queue.py` `launcher.py` |
+| 75% 的 PR 没合入，后期合并跟不上 | 各自 self-merge，冲突自己处理 | 合并队列串行落地，只接受作者本人提交的 PR；用本地裸镜像加 `git merge-tree` 精确判冲突（约 100ms，并列出冲突文件），不依赖 Gitea 异步计算的 mergeable 标志；冲突即时退回作者；队列积压时反压，暂停扩容 | `workspace/merge_queue.py` `workspace/conflicts.py` `launcher.py` |
 | main 被"本地验证过"的合并弄坏 | 只做本地验证 | 在合并后的结果上验证（`verify_command`） | `CommandVerifier` |
 | 热点文件（`main.py` 被 972 个 agent 改过） | 无 | 统计每个文件的合并/冲突/认领次数；认领时对热点告警；prompt 要求用注册表/插件结构，"加文件不改中心文件" | `store.hotspots` `worker_prompt.md.j2` |
 | O(N²) 广播噪声 | 每条 board 新条目推给所有人 | 按认领范围推送相关条目，其余进下一轮摘要（可切回 `all` 做消融实验） | `drain_high(board_mode)` |
 | Gitea 通知 | 每个 worker 各自监听通知 | webhook 汇总到 coord 后定向路由：只发给相关的人，以及认领范围被 main 改动的人 | `workspace/routing.py` |
 | 私信只能在 MCP 工具返回时送达 | 同左 | 额外加 PostToolUse 钩子，任何工具（Bash/Edit…）调用后都能送达 | `adapters/claude_code.py` `/api/drain` |
 | 长上下文下偏离协议 | 协议只在初始 prompt 里 | 每轮开头重发协议卡；按轮数或上下文占比轮换会话，用 handoff 恢复；关键规则放在基础设施层强制（分支保护、push 守卫、FAIL/overlap 事件） | `runtime/worker.py` |
-| 空闲 10 分钟才催 | idle detector 固定 10 分钟 | `continue_after_s`（默认 60s） | `RuntimeSettings` |
+| 空闲 10 分钟才催；没活干时空转烧 token | idle detector 固定 10 分钟 | 首次空闲 60s 就续跑；之后每连续空转一轮等待翻倍，封顶 10 分钟（`max_continue_after_s`），一有新事件就重置。这个问题是本机 K8s 实测里发现的：6 个做完活的 worker 5 分钟空转了约 1.1 万轮 | `runtime/worker.py` |
 | 起步时大家抢同一块 | 固定错峰（30s/3s） | 先让少数创始 worker 搭骨架和接口，再按阶段错峰扩容，并受合并队列反压控制 | `schedule_offsets` |
 | 可观测性 | 事后分析轨迹 | 每次工具调用、每轮、每次投递都记 trace；`/api/admin/status` 提供 KPI（认领冲突、合并落地率、队列深度、沉默 worker、热点）；launcher 用 KPI 做反压 | `store.trace` `store.status` |
 
 ## 5. 安全边界
 
-- 腾讯云 AK/SK 只放在 launcher，永远不进沙箱。
-- 每个 worker 拿到的凭证：自己的 coord token、自己的 Gitea token（只有仓库 write 权限，main 受保护），以及模型 API 凭证。
-- Gitea 的 token 接口只接受 Basic 认证，所以 launcher 用管理员的 Basic 认证给每个 worker 签发 token。
-- prompt 里会夹带同伴写的文本（私信、board、PR 标题），因此 Claude Code 开启 `verbatim_prompts`，不做 @path 展开，也不执行斜杠命令。
-- K8s 模式下，worker Pod 不挂载 ServiceAccount token；launcher 的 Role 只能在自己的 namespace 里管理 pods 和 secrets。
+worker 按不可信对待，约束尽量放在基础设施层，不靠 prompt：
+
+- 腾讯云 AK/SK 只放在 launcher，永远不进沙箱。本地 provider 只按白名单传递环境变量，每个 worker 有自己独立的 HOME。
+- 每个 worker 拿到的凭证：自己的 coord token、自己的 Gitea token，以及模型 API 凭证。git 凭证只写进仓库本地配置，不动全局配置。
+- **分支归属**：main 只有 merge-bot 能写；每个 worker 独占 `<wid>/*` 分支命名空间，别人不能 push、强推或删除。合并队列只接受 PR 作者本人提交。
+- Gitea 设置 `MAX_CREATION_LIMIT=0`，worker 不能自建仓库或 fork（防止借自己仓库的 webhook 做 SSRF）；webhook 目标只允许 coord。
+- 同伴写的文本（私信、频道、claim、scope）渲染进 prompt 前会压成单行，没法伪造 `[event]` 这类系统块；Claude Code 开启 `verbatim_prompts`。
+- webhook 做 HMAC 校验并限制请求体大小；admin token 用常量时间比较；coord 的数据库文件权限是 0600。
+- K8s 模式下：worker Pod 以 uid 1000 运行、drop ALL capabilities、seccomp RuntimeDefault、不挂载 SA token；NetworkPolicy 规定 worker 只能访问 coord、Gitea、DNS 和外网 443 端口，谁也连不进 worker；launcher 的 Role 只能在本 namespace 管理 pods 和 secrets。
+- `verify_command` 会在 coord 所在机器上运行 PR 代码（虽然会降权到 nobody、清空环境变量、在代码运行前删掉带凭证的 remote），**这仍然不是沙箱**。worker 不可信时，应该把验证放到隔离的集成沙箱里跑。
 
 ## 6. 部署
 
@@ -98,8 +103,16 @@ kubectl -n scaling-agent exec deploy/coord -- scaling-agent status
 默认运行文件 `deploy/k8s/run.scripted.yaml` 用脚本化 worker（不调模型）走完整个协作循环，用来验证基础设施。
 要用真模型：把 `harness` 改成 `claude_code`，运行 `up.sh` 前先 `export ANTHROPIC_API_KEY=...`（会写入 `sa-secrets`）。
 
-本机实测记录（6 个 worker × 3 个功能）：18/18 个功能全部合入 main；8 次冲突被退回后解决；
-28 次认领重叠通知、14 条私信；`REGISTRY.md` 被正确识别为热点；直接 push main 被 Gitea 拒绝。
+本机实测（6 个 worker × 3 个功能，每个功能都改同一个热点文件 `REGISTRY.md`，10 分钟一轮）：
+
+| 轮次 | 结果 | 说明 |
+|---|---|---|
+| 初版 | 约 2.5 分钟合入 18/18；5 分钟内空转 11,641 轮 | 暴露两个问题：做完活的 worker 不停空转；冲突判断只等 9 秒，在大规模下会误判 |
+| 修复审查问题后 | 10 分钟合入 16/18，总共 390 轮 | 空闲退避生效；但串行队列要等满 Gitea 的异步检查（最多约 1 分钟）才能退回真冲突，吞吐下降 |
+| 加上 `git merge-tree` 冲突检测 | **约 4 分钟合入 18/18**，11 次冲突即时退回并由作者解决 | 退回消息写明冲突文件；main 上没有重复行，也没有冲突标记 |
+
+每轮都验证过：私信和认领重叠通知的中途送达、提醒和关停送达全部 worker（6/6）、launcher 到点清理 Pod、
+直接 push main 被拒、推到别人的分支命名空间或删别人的分支被拒、worker 建仓库返回 403、worker 访问不到 kube-apiserver。
 
 在这台开发机上搭 k3s 踩到的坑见 `docs/K8S_LOCAL.md`。
 
@@ -113,8 +126,11 @@ kubectl -n scaling-agent exec deploy/coord -- scaling-agent status
 
 ## 7. 已知限制与后续
 
+- 代码经过一轮对抗式审查：4 个方向共报告 48 条，逐条复核后确认 43 条，全部已修复并加了回归测试（`tests/test_regressions.py`）。
+
 - coord 是单进程加 SQLite（WAL）。几百个 worker 的写入量够用；到 1,024 个时建议换 Postgres，并把合并队列拆成独立进程。
 - 合并队列目前串行。下一步是批量合并（一次试合 k 个 PR，失败再二分），提高吞吐。
-- `CommandVerifier` 跑在 coord 所在机器上。重型工具链应该改成在专用的集成沙箱里跑。
+- `CommandVerifier` 跑在 coord 所在机器上（见第 5 节）。应该改成在专用的集成沙箱里跑。
+- board 的"相关性"按投递那一刻的认领范围计算。认领范围在两次投递之间变化时，少量条目可能漏推或重复推送；完整历史随时可以用 `board_grep` 查到。
 - AGS 的几个行为文档没写清，需要用 probe 脚本实测：常驻沙箱是否真的没有 24h 上限、token 有效期、TrafficToken 用哪个请求头。
 - 脚本化 worker 只验证基础设施，不代表模型能力；真实效果要用 `claude_code` harness 跑 benchmark 来评估。

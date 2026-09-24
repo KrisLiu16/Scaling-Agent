@@ -54,6 +54,12 @@ class CoordSettings(BaseSettings):
     merge_queue_enabled: bool = True
     verify_command: str | None = None  # run in a temp checkout of main+PR; empty = trust Gitea mergeability only
     verify_timeout_s: float = 900.0
+    # Bare mirror used to detect merge conflicts with `git merge-tree` (exact, ~100ms) instead of
+    # waiting on Gitea's asynchronous mergeability flag. Empty = fall back to the flag.
+    conflict_mirror_dir: str = "coord-mirror.git"
+    # Only a PR's author may submit it to the merge queue unless this is on (e.g. to let
+    # integrator workers land peers' PRs by agreement).
+    allow_foreign_merge_requests: bool = False
 
 
 class RuntimeSettings(BaseSettings):
@@ -64,12 +70,13 @@ class RuntimeSettings(BaseSettings):
     worker_id: str
     coord_url: str  # e.g. https://coord.example.com
     token: str  # per-worker bearer token for the coordination server
-    workdir: str = "/workspace"
-    state_dir: str = "/workspace/.scaling-agent"
+    workdir: str = "/workspace/repo"  # the git checkout
+    state_dir: str = "/workspace/state"  # runtime state, git credentials, harness transcripts (outside the checkout)
     harness: Literal["claude_code", "scripted", "fake"] = "claude_code"
     model: str | None = None
     # With nothing new for this long, start a "continue" turn (Agensh waits 10 minutes).
     continue_after_s: float = 60.0
+    max_continue_after_s: float = 600.0  # idle backoff cap
     board_reminder: bool = True
     # Session rotation against protocol drift in long contexts: start a fresh session after N turns
     # or past a context-usage threshold; state lives outside the session (claims, board, git,

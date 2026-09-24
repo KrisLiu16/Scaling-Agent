@@ -142,15 +142,19 @@ class GiteaClient:
     async def add_collaborator(self, owner: str, repo: str, username: str, permission: str = "write") -> None:
         await self._request("PUT", f"/repos/{owner}/{repo}/collaborators/{username}", json={"permission": permission})
 
-    async def protect_branch(self, owner: str, repo: str, branch: str, merger: str) -> None:
-        """Only `merger` (the merge-queue bot) may push to or merge into `branch`."""
+    async def protect_branch(
+        self, owner: str, repo: str, branch: str, merger: str, pushers: list[str] | None = None
+    ) -> None:
+        """Only `pushers` (default: just `merger`) may push to `branch` (a name or glob such as
+        `w0001/*`), only `merger` may merge into it, and nobody may force-push or delete it."""
         body = {
             "rule_name": branch,
             "enable_push": True,
             "enable_push_whitelist": True,
-            "push_whitelist_usernames": [merger],
+            "push_whitelist_usernames": pushers or [merger],
             "enable_merge_whitelist": True,
             "merge_whitelist_usernames": [merger],
+            "enable_force_push": False,
         }
         try:
             await self._request("POST", f"/repos/{owner}/{repo}/branch_protections", json=body)
@@ -160,18 +164,22 @@ class GiteaClient:
             await self._request("PATCH", f"/repos/{owner}/{repo}/branch_protections/{branch}", json=body)
 
     async def ensure_webhook(self, owner: str, repo: str, url: str, secret: str) -> None:
+        events = ["push", "pull_request", "issues", "issue_comment", "pull_request_review_comment"]
+        config = {"url": url, "content_type": "json", "secret": secret}
         hooks = await self._request("GET", f"/repos/{owner}/{repo}/hooks") or []
-        if any((h.get("config") or {}).get("url") == url for h in hooks):
-            return
+        for hook in hooks:
+            if (hook.get("config") or {}).get("url") == url:
+                # The secret is write-only in Gitea; always reset it so it matches ours (e.g. after
+                # the coordination server's database was recreated).
+                await self._request(
+                    "PATCH", f"/repos/{owner}/{repo}/hooks/{hook['id']}",
+                    json={"active": True, "config": config, "events": events},
+                )
+                return
         await self._request(
             "POST",
             f"/repos/{owner}/{repo}/hooks",
-            json={
-                "type": "gitea",
-                "active": True,
-                "config": {"url": url, "content_type": "json", "secret": secret},
-                "events": ["push", "pull_request", "issues", "issue_comment", "pull_request_review_comment"],
-            },
+            json={"type": "gitea", "active": True, "config": config, "events": events},
         )
 
     # ------------------------------------------------------------ pull requests

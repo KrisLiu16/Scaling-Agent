@@ -30,6 +30,7 @@ spec:
           imagePullPolicy: IfNotPresent
           env:
             - {name: GITEA_ROOT_URL, value: "http://gitea:3000/"}
+            - {name: GITEA_WEBHOOK_ALLOWED_HOSTS, value: coord}
             - name: GITEA_ADMIN_USER
               valueFrom: {secretKeyRef: {name: sa-secrets, key: gitea-admin-user}}
             - name: GITEA_ADMIN_PASSWORD
@@ -77,6 +78,7 @@ spec:
           env:
             - {name: SA_COORD_SELF_URL, value: "http://coord:8700"}
             - {name: SA_COORD_BOARD_MODE, value: relevant}
+            - {name: SA_COORD_CONFLICT_MIRROR_DIR, value: /data/mirror.git}
             - {name: SA_COORD_GITEA__URL, value: "http://gitea:3000"}
             - {name: SA_COORD_GITEA__OWNER, value: agents}
             - {name: SA_COORD_GITEA__REPO, value: workspace}
@@ -124,3 +126,22 @@ metadata: {name: sa-launcher, namespace: scaling-agent}
 roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: sa-launcher}
 subjects:
   - {kind: ServiceAccount, name: sa-launcher, namespace: scaling-agent}
+---
+# Workers are untrusted: nothing connects to them, and they reach only the organization's services,
+# cluster DNS, and HTTPS outside the private ranges (the model API).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: sa-worker, namespace: scaling-agent}
+spec:
+  podSelector: {matchLabels: {app: sa-worker}}
+  policyTypes: [Ingress, Egress]
+  ingress: []
+  egress:
+    - to: [{podSelector: {matchLabels: {app: coord}}}]
+      ports: [{port: 8700, protocol: TCP}]
+    - to: [{podSelector: {matchLabels: {app: gitea}}}]
+      ports: [{port: 3000, protocol: TCP}]
+    - to: [{namespaceSelector: {}, podSelector: {matchLabels: {k8s-app: kube-dns}}}]
+      ports: [{port: 53, protocol: UDP}, {port: 53, protocol: TCP}]
+    - to: [{ipBlock: {cidr: 0.0.0.0/0, except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16]}}]
+      ports: [{port: 443, protocol: TCP}]

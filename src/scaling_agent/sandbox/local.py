@@ -27,14 +27,16 @@ class LocalProvider(SandboxProvider):
         home = self.root / worker_id
         workdir = home / "workspace"
         workdir.mkdir(parents=True, exist_ok=True)
-        # Start from this machine's environment minus any Claude Code session variables, which would
-        # otherwise leak into the worker's own harness.
-        inherited = {
-            k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE_CODE_", "CLAUDECODE", "CLAUDE_"))
-        }
+        # Only an allowlist of this machine's environment: the launcher's own secrets (coordination
+        # admin token, Gitea admin password, cloud keys) must never reach a worker. Model credentials
+        # arrive through `env` (the run's forward_env). Each worker gets its own HOME.
+        allow = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TMPDIR", "TZ", "VIRTUAL_ENV", "PYTHONPATH")
+        inherited = {k: v for k, v in os.environ.items() if k in allow}
+        (home / "home").mkdir(parents=True, exist_ok=True)
         full_env = {
             **inherited,
             **env,
+            "HOME": str(home / "home"),
             "SA_WORKER_WORKDIR": str(workdir),
             "SA_WORKER_STATE_DIR": str(home / "state"),
         }
@@ -48,7 +50,7 @@ class LocalProvider(SandboxProvider):
         self._procs[worker_id] = await self._spawn(worker_id, env)
         return SandboxHandle(worker_id=worker_id, sandbox_id=f"local-{worker_id}", meta={"pid": str(self._procs[worker_id].pid)})
 
-    async def runtime_alive(self, handle: SandboxHandle) -> bool:
+    async def runtime_alive(self, handle: SandboxHandle) -> bool | None:
         proc = self._procs.get(handle.worker_id)
         return proc is not None and proc.returncode is None
 

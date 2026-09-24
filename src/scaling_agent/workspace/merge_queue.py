@@ -16,18 +16,25 @@ main can break between two "locally verified" merges. The queue fixes both:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
+import re
+import shutil
 import tempfile
 import time
 from dataclasses import dataclass
 from urllib.parse import urlsplit, urlunsplit
 
+import httpx
+
 from ..coord.store import Store
 from ..protocol import Event, MergeRequest, MergeStatus, Priority
+from .conflicts import GitConflictChecker
 from .gitea import GiteaClient, GiteaError, PullRequest
 
 log = logging.getLogger(__name__)
+WIP = re.compile(r"^\s*(\[wip\]|wip:)", re.IGNORECASE)  # Gitea's default WORK_IN_PROGRESS_PREFIXES
 
 
 @dataclass
@@ -42,9 +49,13 @@ class Verifier:
 
 
 class CommandVerifier(Verifier):
-    """Check out main, merge the PR head, run `command`. Runs wherever the coordination server runs.
+    """Check out main, merge the PR head, run `command`.
 
-    For heavy toolchains, point this at a dedicated integration sandbox instead (see DESIGN.md).
+    SECURITY: this runs PR code with the coordination server's uid. It is only acceptable with
+    trusted workers; anything the process can read (its database, tokens) the PR can read. The
+    mitigations here (scrubbed environment, credentials removed from the checkout before the
+    command runs, output returned only to the PR's author) do not make it a sandbox. For untrusted
+    code, run verification in an isolated sandbox instead (see docs/DESIGN.md).
     """
 
     def __init__(self, clone_url: str, token: str, main_branch: str, command: str, timeout_s: float) -> None:
@@ -54,9 +65,9 @@ class CommandVerifier(Verifier):
         self._command = command
         self._timeout = timeout_s
 
-    async def _run(self, *args: str, cwd: str, timeout: float = 300) -> tuple[int, str]:
+    async def _run(self, *args: str, cwd: str, env: dict[str, str], timeout: float = 300) -> tuple[int, str]:
         proc = await asyncio.create_subprocess_exec(
-            *args, cwd=cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+            *args, cwd=cwd, env=env, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
         )
         try:
             out, _ = await asyncio.wait_for(proc.communicate(), timeout)
@@ -67,19 +78,48 @@ class CommandVerifier(Verifier):
 
     async def verify(self, pr: PullRequest) -> VerifyResult:
         with tempfile.TemporaryDirectory(prefix=f"verify-pr{pr.number}-") as tmp:
-            code, out = await self._run("git", "clone", "--quiet", "--branch", self._main, self._url, "repo", cwd=tmp)
+            # Minimal environment: none of this process's secrets are inherited by git or the command.
+            env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": tmp, "LANG": "C.UTF-8",
+                   "GIT_TERMINAL_PROMPT": "0"}
+            code, out = await self._run(
+                "git", "clone", "--quiet", "--branch", self._main, self._url, "repo", cwd=tmp, env=env
+            )
             if code:
-                return VerifyResult(False, f"clone failed: {out[-2000:]}")
+                return VerifyResult(False, "clone failed")
             repo = os.path.join(tmp, "repo")
-            for args in (
-                ("git", "fetch", "--quiet", "origin", f"refs/pull/{pr.number}/head"),
-                ("git", "-c", "user.name=merge-bot", "-c", "user.email=merge-bot@agents.invalid",
-                 "merge", "--no-edit", "--quiet", "FETCH_HEAD"),
-            ):
-                code, out = await self._run(*args, cwd=repo)
+            # Verify exactly the commit that will be merged. refs/pull/N/head trails a push by ~100ms,
+            # so re-fetch briefly before concluding that the head really moved.
+            fetched = ""
+            for attempt in range(6):
+                code, _ = await self._run("git", "fetch", "--quiet", "origin", f"refs/pull/{pr.number}/head", cwd=repo, env=env)
                 if code:
-                    return VerifyResult(False, f"{' '.join(args[:2])} failed: {out[-2000:]}")
-            code, out = await self._run("bash", "-lc", self._command, cwd=repo, timeout=self._timeout)
+                    return VerifyResult(False, "fetching the PR head failed")
+                _, fetched = await self._run("git", "rev-parse", "FETCH_HEAD", cwd=repo, env=env)
+                if fetched.strip() == pr.head_sha:
+                    break
+                await asyncio.sleep(0.5 * (attempt + 1))
+            else:
+                return VerifyResult(False, f"PR head moved during verification ({fetched.strip()[:10]} != {pr.head_sha[:10]}); resubmit")
+            # Drop the tokenized remote before any PR code runs.
+            await self._run("git", "remote", "remove", "origin", cwd=repo, env=env)
+            code, out = await self._run(
+                "git", "-c", "user.name=merge-bot", "-c", "user.email=merge-bot@agents.invalid",
+                "merge", "--no-edit", "--quiet", pr.head_sha, cwd=repo, env=env,
+            )
+            if code:
+                return VerifyResult(False, f"merging into {self._main} failed: {out[-2000:]}")
+            command = ["bash", "-c", self._command]
+            setpriv = shutil.which("setpriv")
+            if os.geteuid() == 0 and setpriv:
+                # Run PR code as `nobody`: it cannot read this process's environment (/proc/<pid>/environ)
+                # or the 0600 database. Still not a sandbox (network, CPU): prefer an isolated verifier.
+                for root, dirs, files in os.walk(tmp):
+                    for name in (*dirs, *files):
+                        with contextlib.suppress(OSError):
+                            os.chown(os.path.join(root, name), 65534, 65534, follow_symlinks=False)
+                os.chown(tmp, 65534, 65534)
+                command = [setpriv, "--reuid=65534", "--regid=65534", "--clear-groups", "--no-new-privs", *command]
+            code, out = await self._run(*command, cwd=repo, env=env, timeout=self._timeout)
             return VerifyResult(code == 0, out[-4000:])
 
 
@@ -93,8 +133,10 @@ class MergeQueue:
         main_branch: str = "main",
         verifier: Verifier | None = None,
         poll_s: float = 2.0,
-        mergeable_retries: int = 3,
-        retry_delay_s: float = 3.0,
+        mergeable_retries: int = 5,
+        retry_delay_s: float = 2.0,
+        allow_foreign_submissions: bool = False,
+        conflicts: GitConflictChecker | None = None,
     ) -> None:
         self.store = store
         self.gitea = gitea
@@ -105,6 +147,9 @@ class MergeQueue:
         self.poll_s = poll_s
         self.mergeable_retries = mergeable_retries
         self.retry_delay_s = retry_delay_s
+        self.allow_foreign_submissions = allow_foreign_submissions
+        self.conflicts = conflicts
+        self._backoff = 2.0
         self._wake = asyncio.Event()
 
     def poke(self) -> None:
@@ -122,9 +167,29 @@ class MergeQueue:
                 continue
             try:
                 await self.process(req)
+            except (httpx.TransportError, GiteaError) as exc:
+                if isinstance(exc, GiteaError) and exc.status < 500:
+                    await self._fail_safely(req, exc)
+                    continue
+                # Gitea is down or overloaded: not the author's fault. Put the request back and wait.
+                log.warning("gitea unavailable while landing PR #%s (%s); re-queued", req.pr_number, exc)
+                with contextlib.suppress(Exception):
+                    await self.store.merge_update(req.id, MergeStatus.QUEUED, f"retrying: {exc}")
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(stop.wait(), self._backoff)
+                self._backoff = min(self._backoff * 2, 120.0)
+                continue
             except Exception as exc:  # keep the queue moving; the author gets the reason
-                log.exception("merge queue failed on PR #%s", req.pr_number)
-                await self._bounce(req, MergeStatus.FAILED, f"merge queue error: {exc}")
+                await self._fail_safely(req, exc)
+                continue
+            self._backoff = 2.0
+
+    async def _fail_safely(self, req: MergeRequest, exc: Exception) -> None:
+        log.error("merge queue failed on PR #%s", req.pr_number, exc_info=exc)
+        try:
+            await self._bounce(req, MergeStatus.FAILED, f"merge queue error: {exc}")
+        except Exception:  # e.g. the store itself failed: the request is re-queued on restart
+            log.exception("could not record the failure of PR #%s", req.pr_number)
 
     async def process(self, req: MergeRequest) -> MergeRequest:
         started = time.time()
@@ -135,24 +200,53 @@ class MergeQueue:
             return await self.store.merge_update(req.id, MergeStatus.CANCELLED, "PR is closed", pr.head_sha)
         if pr.base_ref != self.main:
             return await self._bounce(req, MergeStatus.FAILED, f"PR must target {self.main}, not {pr.base_ref}")
-        files = await self.gitea.pr_files(self.owner, self.repo, pr.number)
-        # Gitea checks mergeability asynchronously after a push and reports `mergeable=false`
-        # while the check is running, so re-read before calling it a conflict.
-        for _ in range(self.mergeable_retries):
-            if pr.mergeable:
-                break
-            await asyncio.sleep(self.retry_delay_s)
-            pr = await self.gitea.get_pr(self.owner, self.repo, req.pr_number)
-        if not pr.mergeable:
-            await self.store.record_file_heat(files, conflicted=True)
+        if pr.author != req.worker and not self.allow_foreign_submissions:
             return await self._bounce(
-                req,
-                MergeStatus.CONFLICT,
-                f"PR #{pr.number} conflicts with {self.main}. Merge the latest {self.main} into "
-                f"{pr.head_ref}, re-run your checks, push, then call merge_request again. "
-                f"Files in this PR: {', '.join(files[:15])}",
-                pr.head_sha,
+                req, MergeStatus.FAILED,
+                f"PR #{pr.number} belongs to {pr.author}; only its author can submit it (ask them by DM)",
             )
+        if WIP.match(pr.title):
+            return await self._bounce(
+                req, MergeStatus.FAILED,
+                f"PR #{pr.number} is marked work-in-progress ({pr.title!r}); Gitea will not merge it. "
+                "Remove the WIP prefix from the title and resubmit.",
+            )
+        files = await self.gitea.pr_files(self.owner, self.repo, pr.number)
+        if self.conflicts is not None:
+            # Exact and immediate: git says whether the merge is clean and which files conflict.
+            report = await self.conflicts.check(pr.number, pr.head_sha)
+            if not report.head_found:
+                return await self._bounce(
+                    req, MergeStatus.CONFLICT, f"PR #{pr.number} head moved while queued; push and resubmit.", pr.head_sha
+                )
+            if not report.clean:
+                await self.store.record_file_heat(report.files or files, conflicted=True)
+                return await self._bounce(
+                    req,
+                    MergeStatus.CONFLICT,
+                    f"PR #{pr.number} conflicts with {self.main} in: {', '.join(report.files[:15]) or 'unknown files'}. "
+                    f"Merge the latest {self.main} into {pr.head_ref}, resolve, re-run your checks, push, "
+                    "then call merge_request again.",
+                    pr.head_sha,
+                )
+        else:
+            # Without a local mirror, fall back to Gitea's asynchronous `mergeable` flag. It reads
+            # false while Gitea re-checks PRs after every push to main, so back off before believing it.
+            for attempt in range(self.mergeable_retries):
+                if pr.mergeable:
+                    break
+                await asyncio.sleep(self.retry_delay_s * (2 ** attempt))
+                pr = await self.gitea.get_pr(self.owner, self.repo, req.pr_number)
+            if not pr.mergeable:
+                await self.store.record_file_heat(files, conflicted=True)
+                return await self._bounce(
+                    req,
+                    MergeStatus.CONFLICT,
+                    f"PR #{pr.number} conflicts with {self.main}. Merge the latest {self.main} into "
+                    f"{pr.head_ref}, re-run your checks, push, then call merge_request again. "
+                    f"Files in this PR: {', '.join(files[:15])}",
+                    pr.head_sha,
+                )
         if self.verifier is not None:
             result = await self.verifier.verify(pr)
             await self.store.trace(req.worker, "merge_verify", {"pr": pr.number, "ok": result.ok})
@@ -165,6 +259,8 @@ class MergeQueue:
                 )
         # 405 ("try again later" while Gitea re-checks mergeability after main moved) and
         # 409 ("cannot lock ref" or a moved head) are often transient: re-read and retry first.
+        # When git already said the merge is clean, a 405 can only mean "still checking".
+        known_clean = self.conflicts is not None
         for attempt in range(self.mergeable_retries + 1):
             try:
                 await self.gitea.merge_pr(self.owner, self.repo, pr.number, pr.head_sha, title=pr.title)
@@ -173,17 +269,24 @@ class MergeQueue:
                 if e.status not in (405, 409):
                     raise
                 fresh = await self.gitea.get_pr(self.owner, self.repo, pr.number)
-                if attempt == self.mergeable_retries or fresh.head_sha != pr.head_sha or (
-                    e.status == 405 and not fresh.mergeable and attempt > 0
+                head_moved = fresh.head_sha != pr.head_sha
+                if not head_moved and attempt < self.mergeable_retries and (
+                    known_clean or e.status == 409 or fresh.mergeable or attempt == 0
                 ):
-                    return await self._bounce(
-                        req,
-                        MergeStatus.CONFLICT,
-                        f"PR #{pr.number} could not land ({e}). Merge the latest {self.main} into "
-                        f"{pr.head_ref}, re-verify, push, and resubmit.",
-                        pr.head_sha,
+                    await asyncio.sleep(self.retry_delay_s * (2 ** attempt))
+                    continue
+                if known_clean and not head_moved:
+                    # Clean per git, but Gitea is still busy: back of the queue, not the author's problem.
+                    return await self.store.merge_update(
+                        req.id, MergeStatus.QUEUED, "gitea still checking mergeability; retrying", pr.head_sha
                     )
-                await asyncio.sleep(self.retry_delay_s)
+                return await self._bounce(
+                    req,
+                    MergeStatus.CONFLICT,
+                    f"PR #{pr.number} could not land ({e}). Merge the latest {self.main} into "
+                    f"{pr.head_ref}, re-verify, push, and resubmit.",
+                    pr.head_sha,
+                )
         await self.store.record_file_heat(files, merged=True)
         done = await self.store.merge_update(req.id, MergeStatus.MERGED, f"landed in {time.time() - started:.0f}s", pr.head_sha)
         await self.store.enqueue(
@@ -218,6 +321,6 @@ class MergeQueue:
         )
         try:
             await self.gitea.comment(self.owner, self.repo, req.pr_number, f"merge queue: {status.value}\n\n{reason}")
-        except GiteaError:
+        except Exception:  # Gitea errors or outages must not take the queue down
             log.warning("could not comment on PR #%s", req.pr_number)
         return updated

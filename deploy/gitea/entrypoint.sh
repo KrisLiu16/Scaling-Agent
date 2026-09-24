@@ -5,6 +5,7 @@ set -eu
 CONF=/data/app.ini
 : "${GITEA_ROOT_URL:=http://gitea:3000/}"
 : "${GITEA_ADMIN_USER:=root}"
+: "${GITEA_WEBHOOK_ALLOWED_HOSTS:=coord}"
 
 if [ ! -f "$CONF" ]; then
   mkdir -p /data/repos /data/log
@@ -28,13 +29,15 @@ SQLITE_JOURNAL_MODE = WAL
 [repository]
 ROOT = /data/repos
 DEFAULT_BRANCH = main
+; workers must not create repositories (or forks): no private webhooks, no side channels
+MAX_CREATION_LIMIT = 0
 
 [security]
 INSTALL_LOCK = true
 SECRET_KEY = $(gitea generate secret SECRET_KEY)
 INTERNAL_TOKEN = $(gitea generate secret INTERNAL_TOKEN)
-; webhooks go to the coordination server on the private network
-ALLOWED_HOST_LIST = *
+; webhooks may only target the coordination server
+ALLOWED_HOST_LIST = ${GITEA_WEBHOOK_ALLOWED_HOSTS}
 
 [service]
 DISABLE_REGISTRATION = true

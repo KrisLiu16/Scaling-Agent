@@ -38,7 +38,12 @@ class CoordClient:
                 delay = min(delay * 2, 30)  # progressively longer waits, like Agensh's dispatcher
         raise RuntimeError(f"coordination server unreachable: {path}")
 
-    async def next_turn(self, wait_s: float) -> tuple[TurnBatch, list[Claim]]:
+    async def wait(self, wait_s: float) -> bool:
+        """Long-poll without leasing anything: True as soon as something should start a turn."""
+        data = await self._post("/api/turns/wait", {"wait_s": wait_s})
+        return bool(data.get("pending"))
+
+    async def next_turn(self, wait_s: float = 0.0) -> tuple[TurnBatch, list[Claim]]:
         data = await self._post("/api/turns/next", {"wait_s": wait_s})
         return TurnBatch.model_validate(data["batch"]), [Claim.model_validate(c) for c in data["claims"]]
 

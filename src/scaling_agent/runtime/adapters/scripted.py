@@ -70,8 +70,14 @@ class ScriptedAdapter(HarnessAdapter):
         return f"{parts.scheme}://{parts.netloc}/api/v1/repos/{owner}/{repo}", owner
 
     async def _open_pr(self) -> int:
+        """Open the PR for this branch, or reuse the one a previous (crashed) attempt opened."""
         base, _ = self._repo_api()
         async with httpx.AsyncClient(headers={"Authorization": f"token {self.gitea_token}"}, timeout=30) as http:
+            existing = await http.get(f"{base}/pulls", params={"state": "open", "limit": 50})
+            existing.raise_for_status()
+            for pr in existing.json():
+                if pr["head"]["ref"] == self.branch:
+                    return int(pr["number"])
             resp = await http.post(
                 f"{base}/pulls",
                 json={"head": self.branch, "base": self.main, "title": f"{self.worker}: feature {self.n}",
@@ -129,19 +135,27 @@ class ScriptedAdapter(HarnessAdapter):
             self.state = "building"
             return
         if self.state == "building":
-            self._git("fetch", "origin", self.main)
+            # Idempotent: a retry after a crash reuses the pushed branch and the open PR.
             self.branch = f"{self.worker}/feature-{self.n}"
-            self._git("checkout", "-B", self.branch, f"origin/{self.main}")
-            feat = self.workdir / "features" / f"{self.worker}_{self.n}.py"
-            feat.parent.mkdir(exist_ok=True)
-            feat.write_text(f'NAME = "{self.worker}-{self.n}"\n\n\ndef run() -> str:\n    return NAME\n')
-            with (self.workdir / REGISTRY).open("a") as fh:
-                fh.write(f"- {self.worker}_{self.n}: features/{self.worker}_{self.n}.py\n")
-            self._git("add", "-A")
-            self._git("commit", "-m", f"{self.worker}: feature {self.n}")
-            self._git("push", "-u", "origin", self.branch, "--force-with-lease")  # own branch only
-            await self._mcp("board_write", {"type": "OBSERVED", "text": f"feature {self.n} of {self.worker} builds; PR next"})
+            self._git("fetch", "origin", self.main)
+            remote = self._git("ls-remote", "--exit-code", "--heads", "origin", self.branch, check=False)
+            if remote.returncode == 0:
+                self._git("fetch", "origin", self.branch)
+                self._git("checkout", "-B", self.branch, f"origin/{self.branch}")
+            else:
+                self._git("checkout", "-B", self.branch, f"origin/{self.main}")
+                feat = self.workdir / "features" / f"{self.worker}_{self.n}.py"
+                feat.parent.mkdir(exist_ok=True)
+                feat.write_text(f'NAME = "{self.worker}-{self.n}"\n\n\ndef run() -> str:\n    return NAME\n')
+                with (self.workdir / REGISTRY).open("a") as fh:
+                    fh.write(f"- {self.worker}_{self.n}: features/{self.worker}_{self.n}.py\n")
+                self._git("add", "-A")
+                self._git("commit", "-m", f"{self.worker}: feature {self.n}")
+                self._git("push", "-u", "origin", self.branch)
+                await self._mcp("board_write", {"type": "OBSERVED", "text": f"feature {self.n} of {self.worker} builds; PR next"})
             self.pr = await self._open_pr()
+            self.state = "submitting"
+        if self.state == "submitting":
             await self._mcp("merge_request", {"pr_number": self.pr})
             self.state = "queued"
             return

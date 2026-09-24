@@ -17,7 +17,7 @@ AREA_PREFIX = "area:"
 
 
 def normalize_item(item: str) -> str:
-    item = item.strip()
+    item = "".join(str(item).split())  # no whitespace (and no newlines) inside a path or tag
     if item.lower().startswith(AREA_PREFIX):
         return AREA_PREFIX + item[len(AREA_PREFIX) :].strip().lower()
     while item.startswith("./"):

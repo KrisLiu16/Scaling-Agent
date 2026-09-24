@@ -29,6 +29,16 @@ class BoardType(str, enum.Enum):
     PATCH_SUMMARY = "PATCH_SUMMARY"
 
 
+def one_line(text: str) -> str:
+    """Collapse peer-written text onto one line.
+
+    Peer text (DMs, channel posts, claim intents, scope items) is rendered into other workers'
+    prompts inside line-oriented blocks such as `[event]`. Newlines would let a peer forge whole
+    blocks (a fake system announcement, say), so they never survive into rendered text.
+    """
+    return " ".join(str(text).split())
+
+
 BOARD_TEXT_CAP = 100
 BOARD_PATCH_SUMMARY_CAP = 300
 BOARD_READ_LIMIT = 2000
@@ -49,8 +59,8 @@ class BoardEntry(BaseModel):
 
     def render(self) -> str:
         more = " (+detail)" if self.has_detail else ""
-        where = f" {{{', '.join(self.scope)}}}" if self.scope else ""
-        return f"#{self.id} [{self.type.value}] {self.agent}{where}: {self.text}{more}"
+        where = f" {{{one_line(', '.join(self.scope))}}}" if self.scope else ""
+        return f"#{self.id} [{self.type.value}] {self.agent}{where}: {one_line(self.text)}{more}"
 
 
 class Claim(BaseModel):
@@ -67,7 +77,10 @@ class Claim(BaseModel):
 
     def render(self, now: float) -> str:
         ttl = max(0, int(self.expires_at - now))
-        return f"claim#{self.id} {self.worker} {{{', '.join(self.scope)}}} — {self.intent} (expires in {ttl}s)"
+        return (
+            f"claim#{self.id} {self.worker} {{{one_line(', '.join(self.scope))}}} — {one_line(self.intent)} "
+            f"(expires in {ttl}s)"
+        )
 
 
 class ClaimResult(BaseModel):
@@ -107,7 +120,7 @@ class Message(BaseModel):
 
     def render(self) -> str:
         where = f"#{self.channel}" if self.channel else "DM"
-        return f"[{where}] {self.sender}: {self.text}"
+        return f"[{where}] {self.sender}: {one_line(self.text)}"
 
 
 class Event(BaseModel):
@@ -128,7 +141,7 @@ class Event(BaseModel):
             f"source={self.source}\n"
             f"kind={self.kind}\n"
             f"observed_at={self.observed_at:.0f}\n"
-            f"summary: {self.summary}"
+            f"summary: {one_line(self.summary)}"
         )
 
 
@@ -152,6 +165,7 @@ class TurnReport(BaseModel):
 
     lease_id: str
     ok: bool = True
+    redeliver: bool = False  # the harness never consumed the prompt: put the lease's events back
     tool_calls: int = 0
     duration_s: float = 0.0
     error: str | None = None

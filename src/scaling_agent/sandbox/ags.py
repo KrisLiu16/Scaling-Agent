@@ -98,32 +98,36 @@ class AgsProvider(SandboxProvider):
 
     async def _launch_runtime(self, handle: SandboxHandle, env: dict[str, str]) -> None:
         sbx = await self._sandbox(handle.sandbox_id)
-        workdir = env.get("SA_WORKER_WORKDIR", "/workspace")
-        state_dir = env.get("SA_WORKER_STATE_DIR", f"{workdir}/.scaling-agent")
+        workdir = env.get("SA_WORKER_WORKDIR", "/workspace/repo")
+        state_dir = env.get("SA_WORKER_STATE_DIR", "/workspace/state")
         cmd = (
-            f"mkdir -p {shlex.quote(state_dir)} && "
+            f"mkdir -p /workspace {shlex.quote(state_dir)} && "
             f"exec {self.s.runtime_command} >> {shlex.quote(state_dir)}/runtime.log 2>&1"
         )
         proc = await sbx.commands.run(
-            f"bash -lc {shlex.quote(cmd)}", background=True, envs=env, cwd=workdir, user="root", timeout=0
+            f"bash -lc {shlex.quote(cmd)}", background=True, envs=env, cwd="/workspace", user="root", timeout=0
         )
         handle.meta["pid"] = str(proc.pid)
 
-    async def start(self, worker_id: str, env: dict[str, str]) -> SandboxHandle:
+    async def start(self, worker_id: str, env: dict[str, str], replaces: str | None = None) -> SandboxHandle:
         if self.tool_id is None:
             raise RuntimeError("call prepare() first")
         inst = await asyncio.to_thread(
-            self.cp.start_instance, self.tool_id, worker_id, self.run_name, self.s.instance_timeout
+            self.cp.start_instance, self.tool_id, worker_id, self.run_name, self.s.instance_timeout, replaces
         )
         handle = SandboxHandle(
             worker_id=worker_id,
             sandbox_id=inst.InstanceId,
             meta={"timeout_s": str(inst.TimeoutSeconds or ""), "expires_at": inst.ExpiresAt or ""},
         )
-        await self._launch_runtime(handle, env)
+        try:
+            await self._launch_runtime(handle, env)
+        except Exception:
+            # Keep the instance: supervision sees no runtime pid and relaunches it in place.
+            log.exception("started %s but could not launch its runtime yet", inst.InstanceId)
         return handle
 
-    async def runtime_alive(self, handle: SandboxHandle) -> bool:
+    async def runtime_alive(self, handle: SandboxHandle) -> bool | None:
         pid = handle.meta.get("pid")
         if not pid:
             return False
@@ -131,14 +135,16 @@ class AgsProvider(SandboxProvider):
             sbx = await self._sandbox(handle.sandbox_id)
             return any(str(p.pid) == pid for p in await sbx.commands.list())
         except Exception:
+            # Unknown, not dead: relaunching now could start a second runtime next to a live one.
             log.warning("could not list processes in %s", handle.sandbox_id, exc_info=True)
             self._tokens.pop(handle.sandbox_id, None)  # maybe an expired token; refresh next time
-            return False
+            return None
 
     async def relaunch(self, handle: SandboxHandle, env: dict[str, str]) -> None:
         inst = await asyncio.to_thread(self.cp.get_instance, handle.sandbox_id)
         if inst is None or inst.Status not in ("RUNNING", "PAUSED"):
-            new = await self.start(handle.worker_id, env)
+            # A replacement instance needs a new idempotency token, or AGS hands back the dead one.
+            new = await self.start(handle.worker_id, env, replaces=handle.sandbox_id)
             handle.sandbox_id, handle.meta = new.sandbox_id, new.meta
             return
         if inst.Status == "PAUSED":

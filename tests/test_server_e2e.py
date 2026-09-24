@@ -131,3 +131,22 @@ async def test_status_and_broadcast(server):
     assert status["pending_events"] == 1 and "merge_queue" in status
     async with server.mcp(tokens["w1"]) as w1:
         assert "T-45min" in text_of(await w1.call_tool("merge_status", {}))
+
+
+async def test_idle_backoff_and_reset(server, tmp_path):
+    tokens = await register(server, "w1", "w2")
+    fake = FakeAdapter()
+    coord = CoordClient(server.url, tokens["w1"])
+    rt = WorkerRuntime("w1", coord, fake, "sys", "[card]", str(tmp_path / "s"),
+                       continue_after_s=0.05, max_continue_after_s=0.2, board_reminder=False)
+    try:
+        await fake.start("sys")
+        await rt.step()
+        await rt.step()
+        assert rt.idle_streak == 2
+        async with server.mcp(tokens["w2"]) as w2:
+            await w2.call_tool("send_dm", {"to": "w1", "text": "wake up"})
+        await rt.step()
+        assert "wake up" in fake.prompts[-1] and rt.idle_streak == 0
+    finally:
+        await coord.close()

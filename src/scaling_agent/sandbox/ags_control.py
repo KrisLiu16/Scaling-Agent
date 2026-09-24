@@ -207,9 +207,14 @@ class AgsControlPlane:
         return None
 
     def start_instance(
-        self, tool_id: str, worker_id: str, run_id: str, timeout: str | None, generation: int = 0, wait_s: float = 600
+        self, tool_id: str, worker_id: str, run_id: str, timeout: str | None, replaces: str | None = None,
+        wait_s: float = 600,
     ) -> models.SandboxInstance:
-        """Idempotent per (run_id, worker_id, generation); re-attaches to a live instance if one exists."""
+        """Idempotent per (run_id, worker_id, replaced instance); re-attaches to a live instance if any.
+
+        The idempotency token of a replacement is derived from the dead instance's id, so it is
+        stable across launcher restarts yet different from the original start.
+        """
         existing = self.find_worker_instance(tool_id, worker_id, run_id)
         if existing is not None:
             if existing.Status == "PAUSED":
@@ -219,7 +224,7 @@ class AgsControlPlane:
         req.ToolId, req.AuthMode = tool_id, "TOKEN"
         if timeout:
             req.Timeout = timeout
-        req.ClientToken = client_token("StartSandboxInstance", run_id, worker_id, str(generation))
+        req.ClientToken = client_token("StartSandboxInstance", run_id, worker_id, replaces or "first")
         req.Metadata = [_meta("worker_id", worker_id), _meta("run_id", run_id)]
         try:
             inst = self.c.StartSandboxInstance(req).Instance

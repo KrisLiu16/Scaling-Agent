@@ -139,13 +139,18 @@ class ClaudeCodeAdapter(HarnessAdapter):
             raise RuntimeError("adapter not started")
         outcome = TurnOutcome()
         await self._client.query(prompt)
-        async for message in self._client.receive_response():
+        # Our turn ends at the ResultMessage that answers our prompt. Background-task completions
+        # produce extra results with a non-human origin; keep reading past those.
+        async for message in self._client.receive_messages():
             if isinstance(message, AssistantMessage):
                 for block in message.content:
                     if isinstance(block, ToolUseBlock):
                         outcome.tool_calls += 1
                         outcome.tools[block.name] = outcome.tools.get(block.name, 0) + 1
             elif isinstance(message, ResultMessage):
+                origin = getattr(message, "origin", None)
+                if origin is not None and origin.get("kind") != "human":
+                    continue
                 outcome.ok = not message.is_error
                 outcome.cost_usd = message.total_cost_usd
                 outcome.usage = message.usage
@@ -153,6 +158,7 @@ class ClaudeCodeAdapter(HarnessAdapter):
                 self.session_id = message.session_id
                 if message.is_error:
                     outcome.error = "; ".join(message.errors or []) or message.subtype
+                break
         try:
             usage = await self._client.get_context_usage()
             outcome.context_pct = float(usage.get("percentage", 0.0))

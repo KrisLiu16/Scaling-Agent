@@ -143,3 +143,50 @@ async def test_mergeability_check_in_progress_is_not_a_conflict(store):
     await store.merge_submit("w1", 6)
     done = await MergeQueue(store, gitea, "org", "repo", retry_delay_s=0).process(await store.merge_next())
     assert done.status is MergeStatus.MERGED
+
+
+def _git(cwd, *args):
+    import subprocess
+
+    return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
+
+
+async def test_git_conflict_checker_finds_exact_conflicts(tmp_path):
+    from scaling_agent.workspace.conflicts import GitConflictChecker
+
+    origin = tmp_path / "origin.git"
+    work = tmp_path / "work"
+    _git(tmp_path, "init", "-q", "--bare", "-b", "main", str(origin))
+    _git(tmp_path, "clone", "-q", str(origin), str(work))
+    _git(work, "config", "user.email", "t@t")
+    _git(work, "config", "user.name", "t")
+    (work / "REGISTRY.md").write_text("base\n")
+    (work / "other.txt").write_text("x\n")
+    _git(work, "add", "-A")
+    _git(work, "commit", "-qm", "base")
+    _git(work, "push", "-q", "origin", "HEAD:main")
+    # PR 1 edits REGISTRY.md, PR 2 edits another file; then main also edits REGISTRY.md.
+    _git(work, "checkout", "-qb", "a")
+    (work / "REGISTRY.md").write_text("base\nfrom a\n")
+    _git(work, "commit", "-qam", "a")
+    sha_a = _git(work, "rev-parse", "HEAD")
+    _git(work, "push", "-q", "origin", "HEAD:refs/pull/1/head")
+    _git(work, "checkout", "-q", "main")
+    _git(work, "checkout", "-qb", "b")
+    (work / "other.txt").write_text("y\n")
+    _git(work, "commit", "-qam", "b")
+    sha_b = _git(work, "rev-parse", "HEAD")
+    _git(work, "push", "-q", "origin", "HEAD:refs/pull/2/head")
+    _git(work, "checkout", "-q", "main")
+    (work / "REGISTRY.md").write_text("base\nfrom main\n")
+    _git(work, "commit", "-qam", "main moves")
+    _git(work, "push", "-q", "origin", "HEAD:main")
+
+    checker = GitConflictChecker(str(tmp_path / "mirror.git"), f"file://{origin}", "unused", "main")
+    checker._url = f"file://{origin}"  # no credentials for a local remote
+    conflict = await checker.check(1, sha_a)
+    assert not conflict.clean and conflict.files == ["REGISTRY.md"]
+    clean = await checker.check(2, sha_b)
+    assert clean.clean
+    moved = await checker.check(2, "0" * 40)
+    assert not moved.head_found

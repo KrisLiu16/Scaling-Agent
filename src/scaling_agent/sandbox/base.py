@@ -28,8 +28,8 @@ class SandboxProvider(abc.ABC):
         """Start (or re-attach to) the sandbox for `worker_id` and launch the worker runtime in it."""
 
     @abc.abstractmethod
-    async def runtime_alive(self, handle: SandboxHandle) -> bool:
-        """Is the worker runtime process still running inside the sandbox?"""
+    async def runtime_alive(self, handle: SandboxHandle) -> bool | None:
+        """Is the worker runtime still running? None means "could not tell" (never relaunch on that)."""
 
     @abc.abstractmethod
     async def relaunch(self, handle: SandboxHandle, env: dict[str, str]) -> None:

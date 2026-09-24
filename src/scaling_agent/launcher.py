@@ -72,6 +72,8 @@ class Launcher:
         self.handles: dict[str, SandboxHandle] = {}
         self.envs: dict[str, dict[str, str]] = {}
         self.restarts: dict[str, int] = {}
+        self.unstarted: set[str] = set()
+        self.launch_id = f"{run.name}-{int(time.time())}"
         self._t0 = 0.0
 
     # ------------------------------------------------------------------ setup
@@ -94,6 +96,9 @@ class Launcher:
             for wid in ids:
                 await self.gitea.ensure_user(wid, secrets.token_urlsafe(24))
                 await self.gitea.add_collaborator(g.owner, g.repo, wid, "write")
+                # Each worker owns the `<wid>/*` branch namespace: peers cannot push to, force-push,
+                # or delete its branches (the merge bot can, to land them).
+                await self.gitea.protect_branch(g.owner, g.repo, f"{wid}/*", g.bot_user, pushers=[wid, g.bot_user])
                 gitea_tokens[wid] = await self.gitea.create_token(
                     wid, f"{self.run.name}-{secrets.token_hex(4)}", ["write:repository", "write:issue", "read:user"]
                 )
@@ -167,6 +172,17 @@ class Launcher:
         depth = status.get("merge_queue", {}).get("depth", 0)
         return depth > self.run.max_queue_per_worker * max(1, len(self.handles))
 
+    async def _start(self, wid: str) -> bool:
+        try:
+            self.handles[wid] = await self.provider.start(wid, self.envs[wid])
+        except Exception:
+            log.exception("failed to start %s; supervision will retry", wid)
+            self.unstarted.add(wid)
+            return False
+        self.unstarted.discard(wid)
+        log.info("started %s (%d/%d) at T+%.0fs", wid, len(self.handles), self.run.workers, self.elapsed())
+        return True
+
     async def ramp(self) -> None:
         for wid, offset in zip(self.run.worker_ids(), schedule_offsets(self.run), strict=True):
             await self._wait_until(offset)
@@ -175,45 +191,61 @@ class Launcher:
                 await self._sleep(30)
             if self.elapsed() >= self.run.duration_s:
                 return
-            try:
-                self.handles[wid] = await self.provider.start(wid, self.envs[wid])
-                log.info("started %s (%d/%d) at T+%.0fs", wid, len(self.handles), self.run.workers, self.elapsed())
-            except Exception:
-                log.exception("failed to start %s; will retry in supervision", wid)
+            await self._start(wid)
 
     async def supervise(self, interval_s: float = 60.0, keepalive_every_s: float = 3600.0, max_restarts: int = 5) -> None:
+        """Keep the organization alive: retry failed starts, relaunch dead runtimes, extend sandboxes.
+
+        A runtime seen healthy for a full interval gets its restart budget back, so a short outage
+        of the coordination server does not use up the budget of the whole fleet. An unknown state
+        (the provider could not check) is never treated as dead, to avoid double runtimes.
+        """
         last_keepalive = self.elapsed()
         while self.elapsed() < self.run.duration_s:
             await self._sleep(interval_s)
+            for wid in sorted(self.unstarted):
+                await self._start(wid)
             do_keepalive = self.elapsed() - last_keepalive >= keepalive_every_s
             for wid, handle in list(self.handles.items()):
                 try:
                     if do_keepalive:
                         await self.provider.keepalive(handle)
-                    if not await self.provider.runtime_alive(handle):
-                        if self.restarts.get(wid, 0) >= max_restarts:
-                            continue
-                        self.restarts[wid] = self.restarts.get(wid, 0) + 1
-                        log.warning("%s runtime is down; relaunch #%d", wid, self.restarts[wid])
-                        await self.provider.relaunch(handle, self.envs[wid])
+                    alive = await self.provider.runtime_alive(handle)
+                    if alive is None:
+                        continue
+                    if alive:
+                        self.restarts.pop(wid, None)
+                        continue
+                    if self.restarts.get(wid, 0) >= max_restarts:
+                        log.error("%s keeps dying; giving up after %d relaunches", wid, max_restarts)
+                        continue
+                    self.restarts[wid] = self.restarts.get(wid, 0) + 1
+                    log.warning("%s runtime is down; relaunch #%d", wid, self.restarts[wid])
+                    await self.provider.relaunch(handle, self.envs[wid])
                 except Exception:
                     log.exception("supervision failed for %s", wid)
             if do_keepalive:
                 last_keepalive = self.elapsed()
 
+    async def _broadcast(self, text: str, key: str, kind: str = "announcement") -> None:
+        try:
+            await self._admin(
+                "POST",
+                "/api/admin/broadcast",
+                # Keys are unique per launch: event ids are deduplicated forever per worker, so a
+                # fixed key would silently drop the reminders of a second run on the same server.
+                json={"text": text, "urgent": True, "kind": kind, "key": f"{self.launch_id}-{key}"},
+            )
+        except Exception:
+            log.exception("broadcast %s failed", key)
+
     async def reminders(self) -> None:
         for reminder in sorted(self.run.reminders, key=lambda r: -r.before_end_s):
             await self._wait_until(self.run.duration_s - reminder.before_end_s)
-            await self._admin(
-                "POST", "/api/admin/broadcast", json={"text": reminder.text, "urgent": True, "key": f"reminder-{reminder.before_end_s:.0f}"}
-            )
+            await self._broadcast(reminder.text, f"reminder-{reminder.before_end_s:.0f}")
 
     async def finish(self, grace_s: float = 60.0) -> None:
-        await self._admin(
-            "POST",
-            "/api/admin/broadcast",
-            json={"text": "Time is up. Stop now.", "urgent": True, "kind": "shutdown", "key": "shutdown"},
-        )
+        await self._broadcast("Time is up. Stop now.", "shutdown", kind="shutdown")
         await self._sleep(grace_s)
         for handle in self.handles.values():
             try:
@@ -231,6 +263,10 @@ class Launcher:
             for t in tasks:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
-            await self.finish()
-            await self._http.aclose()
-            await self.provider.close()
+            try:
+                await self.finish()
+            finally:
+                try:
+                    await self._http.aclose()
+                finally:
+                    await self.provider.close()

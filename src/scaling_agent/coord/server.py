@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hmac
 import json
 import logging
 import secrets
@@ -26,6 +27,7 @@ from starlette.routing import Mount, Route
 from ..config import CoordSettings
 from ..protocol import BoardType, Event, Priority, TurnReport
 from ..workspace.gitea import GiteaClient, verify_signature
+from ..workspace.conflicts import GitConflictChecker
 from ..workspace.merge_queue import CommandVerifier, MergeQueue
 from ..workspace.routing import route_webhook
 from ..prompts import render
@@ -33,6 +35,8 @@ from .render import render_updates
 from .store import SYSTEM, Store, ValidationError
 
 log = logging.getLogger(__name__)
+
+MAX_BODY = 5_000_000
 
 INSTRUCTIONS = (
     "Organization infrastructure for self-organized workers: shared context board, work claims, "
@@ -56,6 +60,10 @@ class Coordinator:
 
     async def start(self) -> None:
         await self.store.open()
+        self.store.on_enqueue = self.wake
+        requeued = await self.store.reset_inflight_merges()
+        if requeued:
+            log.warning("re-queued %d merge requests left in flight by a previous run", requeued)
         g = self.settings.gitea
         self.webhook_secret = g.webhook_secret or await self.store.kv_get("gitea_webhook_secret")
         if g.admin_user and g.admin_password:
@@ -111,6 +119,11 @@ class Coordinator:
         self.gitea = GiteaClient(g.url, bot_token)
         verifier = None
         if self.settings.verify_command:
+            log.warning(
+                "verify_command runs PR code on this host with this process's uid: anything it can read "
+                "(the database, tokens) a malicious PR can read. Use it only with trusted workers, or run "
+                "verification in an isolated sandbox (see docs/DESIGN.md)."
+            )
             verifier = CommandVerifier(
                 f"{g.url.rstrip('/')}/{g.owner}/{g.repo}.git",
                 bot_token,
@@ -118,8 +131,31 @@ class Coordinator:
                 self.settings.verify_command,
                 self.settings.verify_timeout_s,
             )
-        self.merge_queue = MergeQueue(self.store, self.gitea, g.owner, g.repo, g.main_branch, verifier)
-        self._tasks.append(asyncio.create_task(self.merge_queue.run(self._stop), name="merge-queue"))
+        conflicts = None
+        if self.settings.conflict_mirror_dir:
+            conflicts = GitConflictChecker(
+                self.settings.conflict_mirror_dir, f"{g.url.rstrip('/')}/{g.owner}/{g.repo}.git", bot_token, g.main_branch
+            )
+        self.merge_queue = MergeQueue(
+            self.store, self.gitea, g.owner, g.repo, g.main_branch, verifier,
+            allow_foreign_submissions=self.settings.allow_foreign_merge_requests,
+            conflicts=conflicts,
+        )
+        self._tasks.append(asyncio.create_task(self._keep_running(self.merge_queue.run, "merge-queue")))
+
+    async def _keep_running(self, fn: Callable[[asyncio.Event], Awaitable[None]], name: str) -> None:
+        """Restart a background loop if it ever dies, so the merge queue cannot silently stop."""
+        delay = 1.0
+        while not self._stop.is_set():
+            try:
+                await fn(self._stop)
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("%s crashed; restarting in %.0fs", name, delay)
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 60)
 
     async def stop(self) -> None:
         self._stop.set()
@@ -391,24 +427,43 @@ def build_app(settings: CoordSettings) -> Starlette:
         return await store.authenticate(token) if token else None
 
     def is_admin(request: Request) -> bool:
-        return bool(settings.admin_token) and _bearer(request.headers) == settings.admin_token
+        given = _bearer(request.headers) or ""
+        return bool(settings.admin_token) and hmac.compare_digest(given.encode(), settings.admin_token.encode())
 
     async def healthz(request: Request) -> Response:
         return PlainTextResponse("ok")
 
-    async def next_turn(request: Request) -> Response:
-        """Long-poll: return the next turn batch as soon as something is pending (or empty at timeout)."""
+    async def wait_pending(worker: str, wait_s: float) -> bool:
+        deadline = time.time() + min(wait_s, settings.long_poll_s)
+        wake = coord.wakeup_event(worker)
+        while True:
+            wake.clear()  # clear before checking, or a wakeup between check and wait is lost
+            if await store.has_pending(worker):
+                return True
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return False
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(wake.wait(), max(0.1, min(5.0, remaining)))
+
+    async def wait_turn(request: Request) -> Response:
+        """Long-poll without leasing: has anything arrived that should start a turn?"""
         worker = await worker_from(request)
         if worker is None:
             return JSONResponse({"error": "unauthenticated"}, status_code=401)
         body = await request.json() if await request.body() else {}
-        wait_s = min(float(body.get("wait_s", settings.long_poll_s)), settings.long_poll_s)
-        deadline = time.time() + wait_s
-        wake = coord.wakeup_event(worker)
-        while not await store.has_pending(worker) and time.time() < deadline:
-            wake.clear()
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(wake.wait(), max(0.1, min(5.0, deadline - time.time())))
+        await store.touch(worker)
+        pending = await wait_pending(worker, float(body.get("wait_s", settings.long_poll_s)))
+        return JSONResponse({"pending": pending})
+
+    async def next_turn(request: Request) -> Response:
+        """Lease the next turn batch, after waiting (bounded by long_poll_s) for something to arrive."""
+        worker = await worker_from(request)
+        if worker is None:
+            return JSONResponse({"error": "unauthenticated"}, status_code=401)
+        body = await request.json() if await request.body() else {}
+        await store.touch(worker)
+        await wait_pending(worker, float(body.get("wait_s", 0)))
         batch = await store.next_batch(worker, board_mode=settings.board_mode, recent_board=settings.recent_board_in_prompt)
         claims = await store.active_claims(worker)
         return JSONResponse({"batch": batch.model_dump(mode="json"), "claims": [c.model_dump(mode="json") for c in claims]})
@@ -418,7 +473,8 @@ def build_app(settings: CoordSettings) -> Starlette:
         if worker is None:
             return JSONResponse({"error": "unauthenticated"}, status_code=401)
         report = TurnReport.model_validate(await request.json())
-        started = await store.ack(worker, report.lease_id)
+        await store.touch(worker)
+        started = await store.ack(worker, report.lease_id, redeliver=report.redeliver)
         if started is None:
             return JSONResponse({"error": "unknown lease"}, status_code=404)
         await store.trace(worker, "turn", report.model_dump(mode="json"))
@@ -435,6 +491,7 @@ def build_app(settings: CoordSettings) -> Starlette:
         worker = await worker_from(request)
         if worker is None:
             return JSONResponse({"error": "unauthenticated"}, status_code=401)
+        await store.touch(worker)  # a worker deep in Bash/Edit is alive: keep its claims
         events, entries, omitted = await store.drain_high(
             worker, board_mode=settings.board_mode, max_board=settings.max_board_mid_turn
         )
@@ -548,17 +605,19 @@ def build_app(settings: CoordSettings) -> Starlette:
     app = Starlette(
         routes=[
             Route("/healthz", healthz),
+            Route("/api/turns/wait", wait_turn, methods=["POST"]),
             Route("/api/turns/next", next_turn, methods=["POST"]),
             Route("/api/turns/ack", ack_turn, methods=["POST"]),
             Route("/api/drain", drain, methods=["POST"]),
             Route("/api/handoff", handoff, methods=["GET"]),
-            Route("/api/trace", ingest_trace, methods=["POST"]),
+            Route("/api/trace", ingest_trace, methods=["POST"], max_body_size=MAX_BODY),
             Route("/api/prompt", worker_prompt, methods=["GET"]),
             Route("/api/admin/workers", admin_workers, methods=["POST"]),
             Route("/api/admin/prompt", admin_prompt, methods=["PUT"]),
             Route("/api/admin/broadcast", admin_broadcast, methods=["POST"]),
             Route("/api/admin/status", admin_status, methods=["GET"]),
-            Route("/api/gitea/webhook", gitea_webhook, methods=["POST"]),
+            # Unauthenticated until the signature is checked: cap the body before buffering it.
+            Route("/api/gitea/webhook", gitea_webhook, methods=["POST"], max_body_size=MAX_BODY),
             Mount("/", app=mcp_app),  # MCP endpoint at /mcp
         ],
         lifespan=lifespan,

@@ -65,12 +65,21 @@ class K8sProvider(SandboxProvider):
             name="worker",
             image=self.s.image,
             image_pull_policy=self.s.k8s_image_pull_policy,
-            command=["/bin/sh", "-c", f"exec {self.s.runtime_command}"],
+            command=["/bin/sh", "-c", f"mkdir -p /workspace/home && exec {self.s.runtime_command}"],
             env_from=[c.V1EnvFromSource(secret_ref=c.V1SecretEnvSource(name=secret))],
             env=[
                 c.V1EnvVar(name="SA_WORKER_WORKDIR", value="/workspace/repo"),
                 c.V1EnvVar(name="SA_WORKER_STATE_DIR", value="/workspace/state"),
+                c.V1EnvVar(name="HOME", value="/workspace/home"),
             ],
+            security_context=c.V1SecurityContext(
+                run_as_non_root=True,
+                run_as_user=1000,
+                run_as_group=1000,
+                allow_privilege_escalation=False,
+                capabilities=c.V1Capabilities(drop=["ALL"]),
+                seccomp_profile=c.V1SeccompProfile(type="RuntimeDefault"),
+            ),
             resources=c.V1ResourceRequirements(
                 requests={"cpu": self.s.k8s_cpu_request, "memory": self.s.k8s_memory_request},
                 limits={"cpu": self.s.cpu, "memory": self.s.memory},
@@ -80,6 +89,7 @@ class K8sProvider(SandboxProvider):
         return c.V1Pod(
             metadata=c.V1ObjectMeta(name=pod, labels=labels),
             spec=c.V1PodSpec(
+                security_context=c.V1PodSecurityContext(fs_group=1000),
                 containers=[container],
                 restart_policy="Always",
                 automount_service_account_token=False,  # a worker has no business with the k8s API
@@ -110,7 +120,9 @@ class K8sProvider(SandboxProvider):
                 raise
         return SandboxHandle(worker_id=worker_id, sandbox_id=pod.metadata.name, meta={"namespace": self.namespace})
 
-    async def runtime_alive(self, handle: SandboxHandle) -> bool:
+    async def runtime_alive(self, handle: SandboxHandle) -> bool | None:
+        """The kubelet already restarts a crashed container in place (restartPolicy=Always), keeping
+        the pod's workspace. Only a missing pod, or one that has finished, needs a relaunch."""
         from kubernetes.client.rest import ApiException
 
         try:
@@ -118,18 +130,17 @@ class K8sProvider(SandboxProvider):
         except ApiException as e:
             if e.status == 404:
                 return False
-            raise
-        if pod.status.phase in ("Pending",):
-            return True  # still scheduling / pulling: not dead
-        statuses = pod.status.container_statuses or []
-        return pod.status.phase == "Running" and any(s.state and s.state.running for s in statuses)
+            return None
+        return pod.status.phase not in ("Failed", "Succeeded")
 
     async def relaunch(self, handle: SandboxHandle, env: dict[str, str]) -> None:
         await self.stop(handle)
-        for _ in range(60):
+        for _ in range(120):
             if not await self._exists(handle.sandbox_id):
                 break
             await asyncio.sleep(1)
+        else:
+            raise RuntimeError(f"{handle.sandbox_id} is still terminating; will retry")
         await self.start(handle.worker_id, env)
 
     async def _exists(self, name: str) -> bool:
