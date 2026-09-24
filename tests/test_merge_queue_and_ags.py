@@ -1,0 +1,145 @@
+from __future__ import annotations
+
+import json
+
+from scaling_agent.protocol import MergeStatus
+from scaling_agent.workspace.gitea import GiteaError, PullRequest
+from scaling_agent.workspace.merge_queue import MergeQueue, VerifyResult
+
+
+class FakeGitea:
+    def __init__(self, prs: dict[int, PullRequest], merge_error: int | None = None) -> None:
+        self.prs = prs
+        self.merge_error = merge_error
+        self.merged: list[tuple[int, str]] = []
+        self.comments: list[tuple[int, str]] = []
+
+    async def get_pr(self, owner, repo, number):
+        return self.prs[number]
+
+    async def pr_files(self, owner, repo, number):
+        return ["src/main.py", f"src/mod{number}.py"]
+
+    async def merge_pr(self, owner, repo, number, head_sha, title=None):
+        if self.merge_error:
+            raise GiteaError(self.merge_error, "head moved")
+        self.merged.append((number, head_sha))
+
+    async def comment(self, owner, repo, number, body):
+        self.comments.append((number, body))
+
+
+def pr(number: int, mergeable: bool = True, base: str = "main") -> PullRequest:
+    return PullRequest(number=number, state="open", merged=False, mergeable=mergeable, head_ref=f"w1/t{number}",
+                       head_sha=f"sha{number}", base_ref=base, author="w1", title=f"PR {number}")
+
+
+class FailingVerifier:
+    async def verify(self, p):
+        return VerifyResult(False, "3 tests failed")
+
+
+async def test_lands_clean_pr_and_notifies_author(store):
+    gitea = FakeGitea({1: pr(1)})
+    queue = MergeQueue(store, gitea, "org", "repo", retry_delay_s=0)
+    await store.merge_submit("w1", 1)
+    done = await queue.process(await store.merge_next())
+    assert done.status is MergeStatus.MERGED and gitea.merged == [(1, "sha1")]
+    batch = await store.next_batch("w1")
+    assert [e.kind for e in batch.events] == ["merged"]
+
+
+async def test_conflict_bounces_with_high_priority(store):
+    gitea = FakeGitea({2: pr(2, mergeable=False)})
+    queue = MergeQueue(store, gitea, "org", "repo", retry_delay_s=0)
+    await store.merge_submit("w1", 2)
+    done = await queue.process(await store.merge_next())
+    assert done.status is MergeStatus.CONFLICT and not gitea.merged and gitea.comments
+    events, _, _ = await store.drain_high("w1")
+    assert events[0].kind == "merge_conflict" and "Merge the latest main" in events[0].summary
+    hot = {h["path"]: h for h in await store.hotspots()}
+    assert hot["src/main.py"]["conflicts"] == 1
+
+
+async def test_failed_verification_and_head_moved(store):
+    gitea = FakeGitea({3: pr(3)})
+    await store.merge_submit("w1", 3)
+    done = await MergeQueue(store, gitea, "org", "repo", verifier=FailingVerifier(), retry_delay_s=0).process(await store.merge_next())
+    assert done.status is MergeStatus.FAILED and "3 tests failed" in done.detail
+
+    gitea = FakeGitea({4: pr(4)}, merge_error=409)
+    await store.merge_submit("w1", 4)
+    done = await MergeQueue(store, gitea, "org", "repo", retry_delay_s=0).process(await store.merge_next())
+    assert done.status is MergeStatus.CONFLICT
+
+
+async def test_wrong_base_is_rejected(store):
+    gitea = FakeGitea({5: pr(5, base="dev")})
+    await store.merge_submit("w1", 5)
+    done = await MergeQueue(store, gitea, "org", "repo", retry_delay_s=0).process(await store.merge_next())
+    assert done.status is MergeStatus.FAILED and "must target main" in done.detail
+
+
+# --------------------------------------------------------------------------- AGS
+
+
+def test_ags_tool_request_shape():
+    from scaling_agent.sandbox.ags_control import AgsControlPlane, ToolSpec
+
+    cp = AgsControlPlane.__new__(AgsControlPlane)  # no network: only build the request
+    req = cp._create_tool_request(
+        ToolSpec(name="sa-worker", image="sgccr.ccs.tencentyun.com/ns/worker:v1", role_arn="qcs::cam::uin/1:roleName/x", disk="20Gi")
+    )
+    body = json.loads(req.to_json_string())
+    assert body["ToolType"] == "custom" and body["Persistent"] is True
+    sent = req._serialize()  # what the SDK actually sends: None fields are dropped
+    assert "DefaultTimeout" not in sent  # persistent tools: no reclaim deadline requested
+    cc = body["CustomConfiguration"]
+    assert cc["Command"] == ["/bin/sh", "-c"] and "envd -port 49983" in cc["Args"][0]
+    assert cc["Probe"]["HttpGet"] == {"Path": "/health", "Port": 49983, "Scheme": "HTTP"}
+    assert cc["Probe"]["ReadyTimeoutMs"] <= 30000
+    assert cc["Resources"] == {"CPU": "2", "Memory": "4Gi", "Storage": "20Gi"}
+    assert len(body["ClientToken"]) <= 64
+
+
+def test_ags_start_is_idempotent_and_reattaches(monkeypatch):
+    from types import SimpleNamespace
+
+    from scaling_agent.sandbox.ags_control import AgsControlPlane
+
+    calls: list[str] = []
+    running = SimpleNamespace(InstanceId="sbi-1", Status="RUNNING", Metadata=[], TimeoutSeconds=None, ExpiresAt=None)
+
+    class FakeClient:
+        def StartSandboxInstance(self, req):
+            calls.append(json.loads(req.to_json_string())["ClientToken"])
+            return SimpleNamespace(Instance=running)
+
+    cp = AgsControlPlane.__new__(AgsControlPlane)
+    cp.c = FakeClient()
+    cp.region = "ap-singapore"
+    found = {"value": None}
+    monkeypatch.setattr(cp, "find_worker_instance", lambda *a: found["value"])
+    monkeypatch.setattr(cp, "wait_running", lambda iid, wait_s=600: running)
+    cp.start_instance("tool-1", "w0001", "run", timeout=None)
+    cp.start_instance("tool-1", "w0001", "run", timeout=None)
+    assert len(calls) == 2 and calls[0] == calls[1]  # same ClientToken for the same logical start
+    found["value"] = running
+    cp.start_instance("tool-1", "w0001", "run", timeout=None)
+    assert len(calls) == 2  # re-attached to the live instance instead of starting another
+
+
+async def test_mergeability_check_in_progress_is_not_a_conflict(store):
+    class SlowCheckGitea(FakeGitea):
+        def __init__(self):
+            super().__init__({6: pr(6, mergeable=False)})
+            self.reads = 0
+
+        async def get_pr(self, owner, repo, number):
+            self.reads += 1
+            return pr(6, mergeable=self.reads >= 2)  # false while Gitea is still checking
+
+    gitea = SlowCheckGitea()
+    await store.merge_submit("w1", 6)
+    done = await MergeQueue(store, gitea, "org", "repo", retry_delay_s=0).process(await store.merge_next())
+    assert done.status is MergeStatus.MERGED

@@ -1,0 +1,30 @@
+# One run = one launcher Job. The run file and task come from the sa-run ConfigMap (up.sh).
+apiVersion: batch/v1
+kind: Job
+metadata: {name: sa-launch, namespace: scaling-agent}
+spec:
+  backoffLimit: 0
+  template:
+    metadata: {labels: {app: sa-launcher}}
+    spec:
+      serviceAccountName: sa-launcher
+      restartPolicy: Never
+      containers:
+        - name: launcher
+          image: sa-launcher:dev
+          imagePullPolicy: IfNotPresent
+          workingDir: /config
+          command: [scaling-agent, launch, /config/run.yaml]
+          env:
+            - name: SA_COORD_ADMIN_TOKEN
+              valueFrom: {secretKeyRef: {name: sa-secrets, key: coord-admin-token}}
+            - name: SA_GITEA_ADMIN_USER
+              valueFrom: {secretKeyRef: {name: sa-secrets, key: gitea-admin-user}}
+            - name: SA_GITEA_ADMIN_PASSWORD
+              valueFrom: {secretKeyRef: {name: sa-secrets, key: gitea-admin-password}}
+            - name: ANTHROPIC_API_KEY
+              valueFrom: {secretKeyRef: {name: sa-secrets, key: anthropic-api-key, optional: true}}
+          volumeMounts: [{name: run, mountPath: /config}]
+      volumes:
+        - name: run
+          configMap: {name: sa-run}
