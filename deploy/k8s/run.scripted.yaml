@@ -1,0 +1,35 @@
+# Infrastructure smoke run on Kubernetes: scripted workers (no LLM) exercise claims, DMs, the
+# board, git, PRs, the merge queue, and conflict bounces end to end. Switch `harness` to
+# claude_code and put an API key into sa-secrets (anthropic-api-key) for a real run.
+name: k8s-smoke
+task_file: /config/task.md
+workers: 6
+duration_s: 600
+founders: 1
+founding_s: 20
+stagger:
+  - {interval_s: 5}
+max_queue_per_worker: 2.0
+reminders:
+  - {before_end_s: 120, text: "Stop starting new features; land what you have."}
+  - {before_end_s: 30, text: "Merge anything ready, then stop."}
+coord_url: http://coord:8700
+coord_public_url: http://coord:8700
+harness: scripted
+forward_env: [ANTHROPIC_API_KEY]
+worker_env:
+  SA_WORKER_CONTINUE_AFTER_S: "3"
+  SA_SCRIPTED_FEATURES: "3"
+gitea:
+  url: http://gitea:3000
+  public_url: http://gitea:3000
+  owner: agents
+  repo: workspace
+  main_branch: main
+provider:
+  kind: k8s
+  image: sa-worker:dev
+  k8s_namespace: scaling-agent
+  k8s_image_pull_policy: IfNotPresent
+  cpu: "500m"
+  memory: 768Mi

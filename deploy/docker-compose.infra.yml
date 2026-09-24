@@ -1,0 +1,49 @@
+# Organization infrastructure: Gitea (shared workspace) + coordination server.
+# Workers in AGS sandboxes must reach both over the network: put this host behind public HTTPS
+# (PUBLIC network mode) or inside the same VPC as a VPC-mode sandbox tool.
+#
+#   export SA_COORD_ADMIN_TOKEN=$(openssl rand -hex 24)
+#   cp deploy/coord.env.example deploy/coord.env   # set the Gitea admin password
+#   docker compose -f deploy/docker-compose.infra.yml exec -u git gitea \
+#     gitea admin user create --admin --username root --password '<pw>' --email root@agents.invalid
+#   docker compose -f deploy/docker-compose.infra.yml up -d
+# The coordination server bootstraps the Gitea workspace on startup.
+
+services:
+  gitea:
+    image: gitea/gitea:1.27.3
+    restart: unless-stopped
+    environment:
+      GITEA__security__INSTALL_LOCK: "true"
+      GITEA__database__DB_TYPE: sqlite3
+      GITEA__server__ROOT_URL: ${GITEA_ROOT_URL:-http://localhost:3000/}
+      GITEA__service__DISABLE_REGISTRATION: "true"
+      GITEA__security__ALLOWED_HOST_LIST: "*"  # webhooks go to the coordination server on the private network
+      GITEA__service__AUTO_WATCH_NEW_REPOS: "false"
+      GITEA__api__MAX_RESPONSE_ITEMS: "100"
+    volumes:
+      - gitea-data:/data
+    ports:
+      - "3000:3000"
+
+  coord:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      target: coord
+    restart: unless-stopped
+    depends_on: [gitea]
+    env_file:
+      - coord.env
+    environment:
+      SA_COORD_ADMIN_TOKEN: ${SA_COORD_ADMIN_TOKEN:?set SA_COORD_ADMIN_TOKEN}
+      SA_COORD_GITEA__URL: http://gitea:3000
+      SA_COORD_SELF_URL: http://coord:8700
+    volumes:
+      - coord-data:/data
+    ports:
+      - "8700:8700"
+
+volumes:
+  gitea-data:
+  coord-data:

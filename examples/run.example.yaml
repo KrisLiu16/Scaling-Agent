@@ -1,0 +1,41 @@
+# scaling-agent launch examples/run.example.yaml
+# Secrets come from the launcher's environment, never from this file:
+#   SA_COORD_ADMIN_TOKEN, SA_GITEA_ADMIN_TOKEN, TENCENTCLOUD_SECRET_ID/KEY, ANTHROPIC_API_KEY
+
+name: demo-32
+task_file: examples/tasks/example_task.md
+workers: 32
+duration_s: 21600            # 6h
+founders: 4                  # first 4 workers set up the skeleton alone ...
+founding_s: 900              # ... for 15 minutes before the ramp-up
+stagger:                     # then one worker per 30s during the first hour, one per 3s after
+  - {until_s: 3600, interval_s: 30}
+  - {interval_s: 3}
+max_queue_per_worker: 0.5    # pause ramp-up while the merge queue is backed up
+
+coord_url: http://127.0.0.1:8700                 # launcher -> coordination server
+coord_public_url: https://coord.example.com      # sandboxes -> coordination server
+harness: claude_code
+model: null
+forward_env: [ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL]
+
+gitea:
+  url: http://127.0.0.1:3000                    # launcher -> Gitea (admin API)
+  public_url: https://git.example.com           # sandboxes -> Gitea (clone/push/API)
+  owner: agents
+  repo: workspace
+  main_branch: main
+
+provider:
+  kind: ags                  # or "local" for a smoke test on this machine
+  region: ap-singapore       # console rid=9
+  tool_name: sa-worker
+  image: sgccr.ccs.tencentyun.com/<namespace>/sa-worker:v1
+  image_registry_type: personal
+  role_arn: qcs::cam::uin/<uin>:roleName/<role-with-registry-pull>
+  cpu: "2"
+  memory: 4Gi
+  disk: 20Gi
+  network_mode: PUBLIC
+  persistent: true           # 常驻沙箱
+  instance_timeout: null     # persistent tool: no reclaim deadline requested
