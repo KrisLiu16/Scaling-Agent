@@ -1,0 +1,48 @@
+# A real run on Kubernetes: Claude Code workers against an Anthropic Messages endpoint, here a
+# gateway serving a non-Claude model. Fill in the gateway and model, then:
+#   export ANTHROPIC_AUTH_TOKEN=...     # sent as Authorization: Bearer (ANTHROPIC_API_KEY sends x-api-key)
+#   MODEL_EGRESS=<gateway-ip>/32:<port> deploy/k8s/up.sh deploy/k8s/run.claude.yaml <task.md>
+# MODEL_EGRESS is only needed when the gateway is not on port 443 or sits in a private range.
+name: k8s-claude
+task_file: /config/task.md
+workers: 4
+duration_s: 1800
+founders: 1
+founding_s: 300
+stagger:
+  - {interval_s: 60}
+max_queue_per_worker: 1.0
+reminders:
+  - {before_end_s: 600, text: "Stop dispatching new features. Ensure the build works and existing work is merged. Land open PRs through the merge queue; if a PR cannot land, say so and move on."}
+  - {before_end_s: 120, text: "Submit anything ready to the merge queue, then stop. Confirm the build works on main and post the final state."}
+coord_url: http://coord:8700
+coord_public_url: http://coord:8700
+harness: claude_code
+model: <model>                     # passed to Claude Code as --model
+# Secrets come from the launcher's environment (sa-model Secret), never from this file.
+forward_env: [ANTHROPIC_AUTH_TOKEN, ANTHROPIC_API_KEY]
+worker_env:
+  ANTHROPIC_BASE_URL: http://<gateway-host>:<port>   # Claude Code appends /v1/messages
+  # Claude Code resolves its internal model aliases (haiku for background work, subagents) through
+  # these; with a single gateway model they all point at it.
+  ANTHROPIC_MODEL: <model>
+  ANTHROPIC_DEFAULT_OPUS_MODEL: <model>
+  ANTHROPIC_DEFAULT_SONNET_MODEL: <model>
+  ANTHROPIC_DEFAULT_HAIKU_MODEL: <model>
+  CLAUDE_CODE_SUBAGENT_MODEL: <model>
+  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+gitea:
+  url: http://gitea:3000
+  public_url: http://gitea:3000
+  owner: agents
+  repo: workspace
+  main_branch: main
+provider:
+  kind: k8s
+  image: sa-worker:dev
+  k8s_namespace: scaling-agent
+  k8s_image_pull_policy: IfNotPresent
+  cpu: "2"
+  memory: 4Gi
+  k8s_cpu_request: 500m
+  k8s_memory_request: 1Gi

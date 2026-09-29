@@ -22,8 +22,11 @@ spec:
               valueFrom: {secretKeyRef: {name: sa-secrets, key: gitea-admin-user}}
             - name: SA_GITEA_ADMIN_PASSWORD
               valueFrom: {secretKeyRef: {name: sa-secrets, key: gitea-admin-password}}
+            # Model credentials (up.sh); workers get the ones named in the run file's forward_env.
             - name: ANTHROPIC_API_KEY
-              valueFrom: {secretKeyRef: {name: sa-secrets, key: anthropic-api-key, optional: true}}
+              valueFrom: {secretKeyRef: {name: sa-model, key: anthropic-api-key, optional: true}}
+            - name: ANTHROPIC_AUTH_TOKEN
+              valueFrom: {secretKeyRef: {name: sa-model, key: anthropic-auth-token, optional: true}}
           volumeMounts: [{name: run, mountPath: /config}]
       volumes:
         - name: run

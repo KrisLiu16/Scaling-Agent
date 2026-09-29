@@ -40,7 +40,7 @@ src/scaling_agent/
   sandbox/      ags / k8s / local
   prompts/      worker prompt、协议卡
   launcher.py   启动与监督
-deploy/         Dockerfile（coord / launcher / worker / worker-ags）、Gitea 镜像、k8s 清单、compose
-scripts/        ags_probe.py（验证 AGS 行为）
+deploy/         Dockerfile（coord / launcher / worker / worker-ags / infra-ags）、Gitea 镜像、k8s 清单、compose
+scripts/        ags_probe.py（验证 AGS 行为）、ags_infra.py（把 Gitea + coord 放进 AGS 沙箱）
 docs/           设计、AGS、本地 K8s 记录
 ```

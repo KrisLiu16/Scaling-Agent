@@ -101,7 +101,16 @@ kubectl -n scaling-agent exec deploy/coord -- scaling-agent status
 ```
 
 默认运行文件 `deploy/k8s/run.scripted.yaml` 用脚本化 worker（不调模型）走完整个协作循环，用来验证基础设施。
-要用真模型：把 `harness` 改成 `claude_code`，运行 `up.sh` 前先 `export ANTHROPIC_API_KEY=...`（会写入 `sa-secrets`）。
+要用真模型：照 `deploy/k8s/run.claude.yaml` 填网关和模型，运行 `up.sh` 前 `export ANTHROPIC_AUTH_TOKEN=...`
+（或 `ANTHROPIC_API_KEY`，写进 `sa-model` Secret）。网关不在 443 端口或在内网段时，另设 `MODEL_EGRESS=<cidr>:<port>` 放行 worker 出网。
+Claude Code 只发 Anthropic Messages 请求，网关要能在 `/v1/messages` 上服务这个模型。
+
+用 kind：`KIND_CLUSTER=<名字> deploy/k8s/build.sh` 会把镜像装进这个集群；`up.sh` 用当前的 kubectl 上下文，
+机器上还有别的集群时，建集群用 `kind create cluster --kubeconfig <单独的文件>`，跑 `up.sh` 前把 `KUBECONFIG` 指过去。
+同一台机器上第二个 kind 集群起不来、节点里 containerd 报 `failed to create fsnotify watcher: too many open files` 时，
+调大 `fs.inotify.max_user_instances`（2026-09-29 这台机器从 128 调到 512 后正常）。
+kind 自带的 kindnet 不执行 NetworkPolicy（2026-09-29 实测：带 `app=sa-worker` 标签的 Pod 照样连得上策略外的地址），
+worker 的出网限制要换能执行策略的 CNI 才生效。
 
 本机实测（6 个 worker × 3 个功能，每个功能都改同一个热点文件 `REGISTRY.md`，10 分钟一轮）：
 
@@ -120,7 +129,7 @@ kubectl -n scaling-agent exec deploy/coord -- scaling-agent status
 
 详见 `docs/AGS.md`。概要：
 1. `docker buildx build -f deploy/Dockerfile --target worker-ags --platform linux/amd64 -t <registry>/sa-worker:v1 --push .`
-2. 在 VPC 内（或经公网 HTTPS）部署 Gitea 和 coord，要求沙箱能访问到它们。
+2. 在 VPC 内（或经公网 HTTPS）部署 Gitea 和 coord，要求沙箱能访问到它们；访问不到时用 `scripts/ags_infra.py` 把它们也放进一台 AGS 沙箱。
 3. 先跑 `scripts/ags_probe.py`，确认常驻沙箱的超时语义、token 有效期、暂停/恢复后进程是否存活。
 4. 在运行文件里设 `provider.kind: ags`、`region: ap-singapore`（控制台 rid=9），然后执行 `scaling-agent launch run.yaml`。
 
@@ -132,5 +141,5 @@ kubectl -n scaling-agent exec deploy/coord -- scaling-agent status
 - 合并队列目前串行。下一步是批量合并（一次试合 k 个 PR，失败再二分），提高吞吐。
 - `CommandVerifier` 跑在 coord 所在机器上（见第 5 节）。应该改成在专用的集成沙箱里跑。
 - board 的"相关性"按投递那一刻的认领范围计算。认领范围在两次投递之间变化时，少量条目可能漏推或重复推送；完整历史随时可以用 `board_grep` 查到。
-- AGS 的几个行为文档没写清，需要用 probe 脚本实测：常驻沙箱是否真的没有 24h 上限、token 有效期、TrafficToken 用哪个请求头。
+- AGS 实测结果见 `docs/AGS.md`。还没测的是暂停后再恢复（账号的暂停配额被占满），以及常驻实例跑满 24h 以后的表现。
 - 脚本化 worker 只验证基础设施，不代表模型能力；真实效果要用 `claude_code` harness 跑 benchmark 来评估。

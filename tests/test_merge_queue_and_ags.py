@@ -102,6 +102,45 @@ def test_ags_tool_request_shape():
     assert len(body["ClientToken"]) <= 64
 
 
+def test_ags_existing_tool_with_other_config_is_not_reused():
+    from scaling_agent.sandbox.ags_control import AgsControlPlane, ToolSpec, tool_drift
+    from tencentcloud.ags.v20250920 import models
+
+    spec = ToolSpec(name="sa-worker", image="tcr.example/ns/worker:v1", image_registry_type="enterprise", disk="20Gi")
+    cp = AgsControlPlane.__new__(AgsControlPlane)
+    tool = models.SandboxTool()
+    tool._deserialize(json.loads(cp._create_tool_request(spec).to_json_string()))
+    assert tool_drift(tool, spec) == []
+    tool.CustomConfiguration.Resources.Storage = ""  # created without a disk: AGS gives ~1 GiB
+    assert tool_drift(tool, spec) == ["Storage: None != '20Gi'"]
+    spec.extra_ports = [8700]
+    assert "Ports: [49983] != [8700, 49983]" in tool_drift(tool, spec)
+
+
+def test_ags_recreates_tool_after_same_name_tool_was_deleted(monkeypatch):
+    from types import SimpleNamespace
+
+    from scaling_agent.sandbox.ags_control import AgsControlPlane, ToolSpec
+    from tencentcloud.common.exception.tencent_cloud_sdk_exception import TencentCloudSDKException
+
+    tokens: list[str] = []
+
+    class FakeClient:
+        def CreateSandboxTool(self, req):
+            tokens.append(req.ClientToken)
+            if len(tokens) == 1:
+                raise TencentCloudSDKException("FailedOperation.DuplicateRequest", "Previous tool no longer exists.")
+            return SimpleNamespace(ToolId="sdt-2")
+
+    cp = AgsControlPlane.__new__(AgsControlPlane)
+    cp.c = FakeClient()
+    monkeypatch.setattr(cp, "find_tool", lambda name: None)
+    monkeypatch.setattr(cp, "_wait_tool_active", lambda tool_id, wait_s: tool_id)
+    monkeypatch.setattr("scaling_agent.sandbox.ags_control.time.sleep", lambda s: None)
+    assert cp.ensure_tool(ToolSpec(name="sa-worker", image="tcr.example/ns/worker:v1")) == "sdt-2"
+    assert len(tokens) == 2 and tokens[0] != tokens[1]
+
+
 def test_ags_start_is_idempotent_and_reattaches(monkeypatch):
     from types import SimpleNamespace
 

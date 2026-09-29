@@ -10,6 +10,7 @@
 # The full (non-slim) Python image already ships git, curl and a C toolchain, which the worker
 # and the merge-queue verifier need; no package-manager step, so builds work behind strict egress.
 ARG PYTHON_IMAGE=python:3.11-bookworm
+ARG GITEA_IMAGE=gitea/gitea:1.27.3
 
 FROM ${PYTHON_IMAGE} AS base
 RUN git --version
@@ -48,4 +49,18 @@ FROM ccr.ccs.tencentyun.com/ags-image/envd:v0.5.14 AS envd
 FROM worker AS worker-ags
 COPY --from=envd /usr/bin/envd /usr/bin/envd
 RUN chmod 0755 /usr/bin/envd
+CMD ["/usr/bin/envd", "-port", "49983"]
+
+# Organization infrastructure (Gitea + coordination server) in one AGS sandbox, for when worker
+# sandboxes cannot reach any host of yours. scripts/ags_infra.py starts it and exposes both ports
+# through AGS port forwarding. The Gitea binary in the upstream image is statically linked.
+#   docker build -f deploy/Dockerfile --target infra-ags -t sa-infra-ags:dev .
+FROM ${GITEA_IMAGE} AS gitea
+FROM coord AS infra-ags
+COPY --from=gitea /app/gitea/gitea /usr/local/bin/gitea
+COPY deploy/gitea/entrypoint.sh /usr/local/bin/sa-gitea-entrypoint
+COPY --from=envd /usr/bin/envd /usr/bin/envd
+RUN chmod 0755 /usr/local/bin/gitea /usr/local/bin/sa-gitea-entrypoint /usr/bin/envd \
+ && useradd -m -u 1000 -s /bin/sh git \
+ && mkdir -p /data && chown git:git /data
 CMD ["/usr/bin/envd", "-port", "49983"]

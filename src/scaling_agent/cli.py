@@ -89,11 +89,15 @@ def status(coord_url: str = typer.Option("http://127.0.0.1:8700", envvar="SA_COO
 
 
 @ags_app.command("check")
-def ags_check(region: str = "ap-singapore", tool_name: str = "sa-worker") -> None:
+def ags_check(
+    region: str = "ap-singapore",
+    tool_name: str = "sa-worker",
+    endpoint: str = typer.Option("ags.tencentcloudapi.com", help="ags.intl.tencentcloudapi.com for international-site accounts"),
+) -> None:
     """Verify AK/SK and endpoint reachability; print quota and whether the worker tool exists."""
     from .sandbox.ags_control import AgsControlPlane
 
-    cp = AgsControlPlane(os.environ["TENCENTCLOUD_SECRET_ID"], os.environ["TENCENTCLOUD_SECRET_KEY"], region)
+    cp = AgsControlPlane(os.environ["TENCENTCLOUD_SECRET_ID"], os.environ["TENCENTCLOUD_SECRET_KEY"], region, endpoint)
     typer.echo(json.dumps({"quota(usage,limit)": cp.quota()}, indent=2))
     tool = cp.find_tool(tool_name)
     typer.echo(f"tool {tool_name}: " + (f"{tool.ToolId} status={tool.Status} persistent={tool.Persistent}" if tool else "absent"))

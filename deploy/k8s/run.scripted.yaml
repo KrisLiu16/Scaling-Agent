@@ -1,6 +1,6 @@
 # Infrastructure smoke run on Kubernetes: scripted workers (no LLM) exercise claims, DMs, the
 # board, git, PRs, the merge queue, and conflict bounces end to end. Switch `harness` to
-# claude_code and put an API key into sa-secrets (anthropic-api-key) for a real run.
+# claude_code for a real run (model settings: deploy/k8s/run.claude.yaml, deploy/k8s/up.sh).
 name: k8s-smoke
 task_file: /config/task.md
 workers: 6

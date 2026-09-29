@@ -57,6 +57,9 @@ class ToolSpec:
     security_group_ids: list[str] = field(default_factory=list)
     default_timeout: str | None = None
     persistent: bool = True
+    # Ports reachable through AGS port forwarding at https://{port}-{instanceId}.{region}.tencentags.com,
+    # besides envd's own.
+    extra_ports: list[int] = field(default_factory=list)
     description: str = "scaling-agent worker"
 
 
@@ -70,6 +73,36 @@ def _meta(k: str, v: str) -> models.MetadataVar:
     m = models.MetadataVar()
     m.Name, m.Value = k, str(v)
     return m
+
+
+def tool_drift(tool: models.SandboxTool, spec: ToolSpec) -> list[str]:
+    """Differences between an existing tool and the spec, as `field: have != want`."""
+    cc = tool.CustomConfiguration
+    res = cc.Resources if cc else None
+    net = tool.NetworkConfiguration
+    have = {
+        "Persistent": bool(tool.Persistent),
+        "Image": cc.Image if cc else None,
+        "ImageRegistryType": cc.ImageRegistryType if cc else None,
+        "RoleArn": tool.RoleArn or None,
+        "CPU": res.CPU if res else None,
+        "Memory": res.Memory if res else None,
+        "Storage": (res.Storage if res else None) or None,
+        "NetworkMode": net.NetworkMode if net else None,
+        "Ports": sorted(p.Port for p in (cc.Ports or [])) if cc else [],
+    }
+    want = {
+        "Persistent": spec.persistent,
+        "Image": spec.image,
+        "ImageRegistryType": spec.image_registry_type,
+        "RoleArn": spec.role_arn or None,
+        "CPU": spec.cpu,
+        "Memory": spec.memory,
+        "Storage": spec.disk or None,
+        "NetworkMode": spec.network_mode,
+        "Ports": sorted({ENVD_PORT, *spec.extra_ports}),
+    }
+    return [f"{k}: {have[k]!r} != {want[k]!r}" for k in want if have[k] != want[k]]
 
 
 class AgsControlPlane:
@@ -100,22 +133,31 @@ class AgsControlPlane:
     def ensure_tool(self, spec: ToolSpec, wait_s: float = 900) -> str:
         existing = self.find_tool(spec.name)
         if existing is not None:
-            if bool(existing.Persistent) != spec.persistent:
+            drift = tool_drift(existing, spec)
+            if drift:
+                # Reusing it would silently run workers on another image, disk, or network.
                 raise AgsError(
-                    f"tool {spec.name} exists with Persistent={existing.Persistent}; persistence cannot be "
-                    "updated, so use a different tool_name"
+                    f"tool {spec.name} exists with a different configuration ({'; '.join(drift)}); "
+                    "delete it or use a different tool_name"
                 )
             return self._wait_tool_active(existing.ToolId, wait_s)
+        req = self._create_tool_request(spec)
         try:
-            tool_id = self.c.CreateSandboxTool(self._create_tool_request(spec)).ToolId
+            tool_id = self.c.CreateSandboxTool(req).ToolId
         except TencentCloudSDKException as e:
             if e.get_code() not in ("InvalidParameterValue.SandboxTool", *IDEMPOTENCY_HITS):
                 raise
             time.sleep(2)
             existing = self.find_tool(spec.name)
-            if existing is None:
+            if existing is not None:
+                tool_id = existing.ToolId
+            elif e.get_code() == "FailedOperation.DuplicateRequest":
+                # The token belongs to a tool of the same name and image that was deleted since;
+                # AGS refuses to reuse it ("Previous tool no longer exists").
+                req.ClientToken = client_token("CreateSandboxTool", spec.name, spec.image, str(time.time_ns()))
+                tool_id = self.c.CreateSandboxTool(req).ToolId
+            else:
                 raise
-            tool_id = existing.ToolId
         return self._wait_tool_active(tool_id, wait_s)
 
     def _create_tool_request(self, spec: ToolSpec) -> models.CreateSandboxToolRequest:
@@ -138,9 +180,11 @@ class AgsControlPlane:
         cc.Image, cc.ImageRegistryType = spec.image, spec.image_registry_type
         cc.Command, cc.Args = spec.command, spec.args
         cc.Env = [_env(k, v) for k, v in spec.env.items()]
-        port = models.PortConfiguration()
-        port.Name, port.Port, port.Protocol = "envd", ENVD_PORT, "TCP"
-        cc.Ports = [port]
+        cc.Ports = []
+        for name, number in [("envd", ENVD_PORT), *((f"port-{p}", p) for p in spec.extra_ports)]:
+            port = models.PortConfiguration()
+            port.Name, port.Port, port.Protocol = name, number, "TCP"
+            cc.Ports.append(port)
         res = models.ResourceConfiguration()
         res.CPU, res.Memory = spec.cpu, spec.memory
         if spec.disk:
@@ -208,12 +252,13 @@ class AgsControlPlane:
 
     def start_instance(
         self, tool_id: str, worker_id: str, run_id: str, timeout: str | None, replaces: str | None = None,
-        wait_s: float = 600,
+        wait_s: float = 600, auth_mode: str = "TOKEN",
     ) -> models.SandboxInstance:
         """Idempotent per (run_id, worker_id, replaced instance); re-attaches to a live instance if any.
 
         The idempotency token of a replacement is derived from the dead instance's id, so it is
         stable across launcher restarts yet different from the original start.
+        `auth_mode`: TOKEN puts every port behind X-Access-Token; PUBLIC keeps only envd behind it.
         """
         existing = self.find_worker_instance(tool_id, worker_id, run_id)
         if existing is not None:
@@ -221,7 +266,7 @@ class AgsControlPlane:
                 self.resume(existing.InstanceId, timeout)
             return self.wait_running(existing.InstanceId, wait_s)
         req = models.StartSandboxInstanceRequest()
-        req.ToolId, req.AuthMode = tool_id, "TOKEN"
+        req.ToolId, req.AuthMode = tool_id, auth_mode
         if timeout:
             req.Timeout = timeout
         req.ClientToken = client_token("StartSandboxInstance", run_id, worker_id, replaces or "first")

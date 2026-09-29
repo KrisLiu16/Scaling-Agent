@@ -30,6 +30,7 @@ from tencentcloud.ags.v20250920 import models
 from scaling_agent.sandbox.ags_control import ENVD_PORT, AgsControlPlane, ToolSpec
 
 REGION = os.getenv("AGS_REGION", "ap-singapore")
+ENDPOINT = os.getenv("AGS_ENDPOINT", "ags.tencentcloudapi.com")  # international site: ags.intl.tencentcloudapi.com
 DOMAIN = f"{REGION}.tencentags.com"
 
 
@@ -39,7 +40,7 @@ def show(label: str, inst) -> None:
 
 
 async def main() -> None:
-    cp = AgsControlPlane(os.environ["TENCENTCLOUD_SECRET_ID"], os.environ["TENCENTCLOUD_SECRET_KEY"], REGION)
+    cp = AgsControlPlane(os.environ["TENCENTCLOUD_SECRET_ID"], os.environ["TENCENTCLOUD_SECRET_KEY"], REGION, ENDPOINT)
     print("quota (usage, limit):", json.dumps(cp.quota()))
     name = os.getenv("AGS_TOOL_NAME", "sa-probe")
     tool_id = cp.ensure_tool(
@@ -54,39 +55,44 @@ async def main() -> None:
     print("tool", tool_id, "persistent=", cp.get_tool(tool_id).Persistent)
 
     inst = cp.start_instance(tool_id, "probe", f"probe-{int(time.time())}", timeout=None)
-    show("started", inst)
-    token, expires_at = cp.acquire_token(inst.InstanceId)
-    raw = cp.c.AcquireSandboxInstanceToken(_token_req(inst.InstanceId))
-    print("token expires_at=", expires_at, "traffic token returned=", bool(raw.TrafficToken))
+    try:
+        show("started", inst)
+        token, expires_at = cp.acquire_token(inst.InstanceId)
+        raw = cp.c.AcquireSandboxInstanceToken(_token_req(inst.InstanceId))
+        print("token expires_at=", expires_at, "traffic token returned=", bool(raw.TrafficToken))
 
-    cfg = ConnectionConfig(domain=DOMAIN, request_timeout=60, extra_sandbox_headers={
-        "X-Access-Token": token, "E2b-Sandbox-Id": inst.InstanceId, "E2b-Sandbox-Port": str(ENVD_PORT)})
-    sbx = AsyncSandbox(sandbox_id=inst.InstanceId, sandbox_domain=DOMAIN, envd_version=Version("0.5.14"),
-                       envd_access_token=token, connection_config=cfg)
-    r = await sbx.commands.run("uname -a; id; df -h / | tail -1; which git python3", user="root")
-    print("exec exit", r.exit_code, "\n", r.stdout)
-    await sbx.files.write("/workspace/probe.txt", "hello")
-    print("file read:", await sbx.files.read("/workspace/probe.txt"))
-    bg = await sbx.commands.run("sleep 3600", background=True, user="root", timeout=0)
-    print("background pid", bg.pid)
+        cfg = ConnectionConfig(domain=DOMAIN, request_timeout=60, extra_sandbox_headers={
+            "X-Access-Token": token, "E2b-Sandbox-Id": inst.InstanceId, "E2b-Sandbox-Port": str(ENVD_PORT)})
+        sbx = AsyncSandbox(sandbox_id=inst.InstanceId, sandbox_domain=DOMAIN, envd_version=Version("0.5.14"),
+                           envd_access_token=token, connection_config=cfg)
+        r = await sbx.commands.run("uname -a; id; df -h / | tail -1; which git python3", user="root")
+        print("exec exit", r.exit_code, "\n", r.stdout)
+        await sbx.files.write("/workspace/probe.txt", "hello")
+        print("file read:", await sbx.files.read("/workspace/probe.txt"))
+        # Workers must reach the coordination server and Gitea: check the public URLs the run will use.
+        for url in filter(None, os.getenv("AGS_PROBE_URLS", "").split(",")):
+            reach = await sbx.commands.run(f"curl -sS -m 10 -o /dev/null -w %{{http_code}} {url} || true", user="root")
+            print("reach", url, "->", reach.stdout.strip() or reach.stderr.strip())
+        bg = await sbx.commands.run("sleep 3600", background=True, user="root", timeout=0)
+        print("background pid", bg.pid)
 
-    pause = models.PauseSandboxInstanceRequest()
-    pause.InstanceId, pause.Memory = inst.InstanceId, True
-    cp.c.PauseSandboxInstance(pause)
-    for _ in range(60):
-        if (cur := cp.get_instance(inst.InstanceId)).Status == "PAUSED":
-            break
-        time.sleep(3)
-    show("paused", cur)
-    cp.resume(inst.InstanceId, None)
-    show("resumed", cp.wait_running(inst.InstanceId))
-    pids = [p.pid for p in await sbx.commands.list()]
-    print("background process survived pause/resume:", bg.pid in pids)
-
-    if os.getenv("AGS_KEEP", "0") != "1":
-        cp.stop(inst.InstanceId)
-        print("stopped", inst.InstanceId)
-
+        pause = models.PauseSandboxInstanceRequest()
+        pause.InstanceId, pause.Memory = inst.InstanceId, True
+        cp.c.PauseSandboxInstance(pause)
+        for _ in range(60):
+            if (cur := cp.get_instance(inst.InstanceId)).Status == "PAUSED":
+                break
+            time.sleep(3)
+        show("paused", cur)
+        cp.resume(inst.InstanceId, None)
+        show("resumed", cp.wait_running(inst.InstanceId))
+        pids = [p.pid for p in await sbx.commands.list()]
+        print("background process survived pause/resume:", bg.pid in pids)
+    finally:
+        # Stop even when a step fails: an instance of a persistent tool has no reclaim deadline.
+        if os.getenv("AGS_KEEP", "0") != "1":
+            cp.stop(inst.InstanceId)
+            print("stopped", inst.InstanceId)
 
 def _token_req(instance_id: str) -> models.AcquireSandboxInstanceTokenRequest:
     req = models.AcquireSandboxInstanceTokenRequest()
