@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from scaling_agent.protocol import MergeStatus
 from scaling_agent.workspace.gitea import GiteaError, PullRequest
 from scaling_agent.workspace.merge_queue import MergeQueue, VerifyResult
@@ -116,6 +118,18 @@ def test_ags_existing_tool_with_other_config_is_not_reused():
     spec.extra_ports = [8700]
     assert "Ports: [49983] != [8700, 49983]" in tool_drift(tool, spec)
 
+    vpc = ToolSpec(name="sa-worker", image="i:v1", network_mode="VPC", subnet_ids=["subnet-a"], security_group_ids=["sg-1"])
+    tool = models.SandboxTool()
+    tool._deserialize(json.loads(cp._create_tool_request(vpc).to_json_string()))
+    assert tool_drift(tool, vpc) == []
+    vpc.subnet_ids, vpc.security_group_ids = ["subnet-b"], []
+    assert tool_drift(tool, vpc) == ["SubnetIds: ['subnet-a'] != ['subnet-b']", "SecurityGroupIds: ['sg-1'] != []"]
+    # leftover VPC settings on a PUBLIC tool are never sent, so they are not drift
+    public = ToolSpec(name="sa-worker", image="i:v1", subnet_ids=["subnet-a"], security_group_ids=["sg-1"])
+    tool = models.SandboxTool()
+    tool._deserialize(json.loads(cp._create_tool_request(public).to_json_string()))
+    assert tool_drift(tool, public) == []
+
 
 def test_ags_recreates_tool_after_same_name_tool_was_deleted(monkeypatch):
     from types import SimpleNamespace
@@ -139,6 +153,50 @@ def test_ags_recreates_tool_after_same_name_tool_was_deleted(monkeypatch):
     monkeypatch.setattr("scaling_agent.sandbox.ags_control.time.sleep", lambda s: None)
     assert cp.ensure_tool(ToolSpec(name="sa-worker", image="tcr.example/ns/worker:v1")) == "sdt-2"
     assert len(tokens) == 2 and tokens[0] != tokens[1]
+
+
+def test_ags_start_after_stopped_instance_of_same_name_uses_a_new_token(monkeypatch):
+    from types import SimpleNamespace
+
+    from scaling_agent.sandbox.ags_control import AgsControlPlane
+
+    tokens: list[str] = []
+    stopped = SimpleNamespace(InstanceId="sbi-1", Status="STOPPED", Metadata=[])
+    running = SimpleNamespace(InstanceId="sbi-2", Status="RUNNING", Metadata=[])
+
+    class FakeClient:
+        def StartSandboxInstance(self, req):
+            tokens.append(req.ClientToken)
+            return SimpleNamespace(Instance=stopped if len(tokens) == 1 else running)
+
+    cp = AgsControlPlane.__new__(AgsControlPlane)
+    cp.c = FakeClient()
+    monkeypatch.setattr(cp, "find_worker_instance", lambda *a: None)
+    monkeypatch.setattr(cp, "wait_running", lambda iid, wait_s=600: running)
+    assert cp.start_instance("tool-1", "infra", "sa-infra", timeout=None).InstanceId == "sbi-2"
+    assert len(tokens) == 2 and tokens[0] != tokens[1]
+
+
+def test_ags_start_request_in_progress_never_starts_a_second_instance(monkeypatch):
+    from types import SimpleNamespace
+
+    from scaling_agent.sandbox.ags_control import AgsControlPlane
+    from tencentcloud.common.exception.tencent_cloud_sdk_exception import TencentCloudSDKException
+
+    calls: list[str] = []
+
+    class FakeClient:
+        def StartSandboxInstance(self, req):
+            calls.append(req.ClientToken)
+            raise TencentCloudSDKException("FailedOperation.RequestInProgress", "still starting")
+
+    cp = AgsControlPlane.__new__(AgsControlPlane)
+    cp.c = FakeClient()
+    monkeypatch.setattr(cp, "find_worker_instance", lambda *a: None)
+    monkeypatch.setattr("scaling_agent.sandbox.ags_control.time.sleep", lambda s: None)
+    with pytest.raises(TencentCloudSDKException):
+        cp.start_instance("tool-1", "w0001", "run", timeout=None)
+    assert len(calls) == 1
 
 
 def test_ags_start_is_idempotent_and_reattaches(monkeypatch):
@@ -229,3 +287,31 @@ async def test_git_conflict_checker_finds_exact_conflicts(tmp_path):
     assert clean.clean
     moved = await checker.check(2, "0" * 40)
     assert not moved.head_found
+
+
+async def test_ags_runtime_launch_does_not_need_a_workspace_directory_in_the_image(monkeypatch):
+    from types import SimpleNamespace
+
+    from scaling_agent.config import ProviderSettings
+    from scaling_agent.sandbox.ags import AgsProvider
+    from scaling_agent.sandbox.base import SandboxHandle
+
+    monkeypatch.setenv("TENCENTCLOUD_SECRET_ID", "id")
+    monkeypatch.setenv("TENCENTCLOUD_SECRET_KEY", "key")
+    calls: list[dict] = []
+
+    class FakeCommands:
+        async def run(self, cmd, **kw):
+            calls.append({"cmd": cmd, **kw})
+            return SimpleNamespace(pid=7)
+
+    provider = AgsProvider(ProviderSettings(kind="ags", image="i", runtime_command="my-runtime"), "run")
+
+    async def fake_sandbox(sandbox_id):
+        return SimpleNamespace(commands=FakeCommands())
+
+    monkeypatch.setattr(provider, "_sandbox", fake_sandbox)
+    handle = SandboxHandle(worker_id="w1", sandbox_id="sbi-1")
+    await provider._launch_runtime(handle, {"SA_WORKER_STATE_DIR": "/data/state"})
+    assert calls[0]["cwd"] == "/"  # a task image may have no /workspace; the command creates what it needs
+    assert "mkdir -p /workspace /data/state" in calls[0]["cmd"] and "exec my-runtime" in calls[0]["cmd"]

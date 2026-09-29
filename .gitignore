@@ -11,3 +11,5 @@ build/
 deploy/coord.env
 deploy/gitea/gitea
 deploy/wheels/*.whl
+deploy/pi/*
+!deploy/pi/.keep

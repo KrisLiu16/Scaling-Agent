@@ -5,7 +5,13 @@ from __future__ import annotations
 from .base import DrainFn, HarnessAdapter, TurnOutcome
 
 
-def build_adapter(kind: str, **kwargs) -> HarnessAdapter:
+def build_adapter(kind: str, options: dict | None = None, **kwargs) -> HarnessAdapter:
+    if options and kind != "pi":
+        raise ValueError(f"harness_options are not supported by harness {kind!r}")
+    if kind == "pi":
+        from .pi import PiAdapter
+
+        return PiAdapter(options=options, **kwargs)
     if kind == "claude_code":
         from .claude_code import ClaudeCodeAdapter
 

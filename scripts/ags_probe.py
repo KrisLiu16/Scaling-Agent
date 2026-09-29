@@ -54,7 +54,14 @@ async def main() -> None:
     )
     print("tool", tool_id, "persistent=", cp.get_tool(tool_id).Persistent)
 
-    inst = cp.start_instance(tool_id, "probe", f"probe-{int(time.time())}", timeout=None)
+    run_id = f"probe-{int(time.time())}"
+    try:
+        inst = cp.start_instance(tool_id, "probe", run_id, timeout=None)
+    except BaseException:
+        # The instance may exist even though waiting for it failed: an instance of a persistent tool has no reclaim deadline.
+        if (leaked := cp.find_worker_instance(tool_id, "probe", run_id)) is not None:
+            cp.stop(leaked.InstanceId)
+        raise
     try:
         show("started", inst)
         token, expires_at = cp.acquire_token(inst.InstanceId)

@@ -13,7 +13,7 @@ Scaling-Agent 是一个多 Agent 协作框架：N 个完全对等的 agent 用�
 | 进程 | 命令 | 说明 |
 |---|---|---|
 | coordination server | `scaling-agent coord serve` | board / claims / 消息 / 事件投递 / 合并队列 / KPI，对 worker 暴露 MCP 工具 |
-| worker runtime | `scaling-agent worker run` | 跑在每个沙箱里，驱动 Claude Code（或 scripted/fake harness） |
+| worker runtime | `scaling-agent worker run` | 跑在每个沙箱里，驱动 Claude Code 或 pi（另有 scripted/fake harness） |
 | launcher | `scaling-agent launch run.yaml` | 错峰启动 worker、反压、存活监控、提醒、收尾 |
 | status | `scaling-agent status` | 查看组织的 KPI |
 
@@ -26,7 +26,7 @@ Scaling-Agent 是一个多 Agent 协作框架：N 个完全对等的 agent 用�
 uv venv && uv pip install -e ".[worker,ags,k8s,dev]" && .venv/bin/pytest
 
 # 本机 K8s 集群：四个镜像 + Gitea + coord + launcher Job，用 scripted worker 验证整套流程
-deploy/k8s/build.sh && deploy/k8s/up.sh
+KIND_CLUSTER=<集群名> deploy/k8s/build.sh && deploy/k8s/up.sh   # kind 要靠 KIND_CLUSTER 把镜像装进集群
 kubectl -n scaling-agent exec deploy/coord -- scaling-agent status
 ```
 
@@ -36,7 +36,7 @@ kubectl -n scaling-agent exec deploy/coord -- scaling-agent status
 src/scaling_agent/
   coord/        board、claims、消息、事件、MCP 工具、HTTP API
   workspace/    Gitea 客户端、webhook 路由、合并队列
-  runtime/      worker 事件循环、harness 适配器（claude_code / scripted / fake）
+  runtime/      worker 事件循环、harness 适配器（claude_code / pi / scripted / fake）
   sandbox/      ags / k8s / local
   prompts/      worker prompt、协议卡
   launcher.py   启动与监督

@@ -8,11 +8,15 @@ envd stays behind one. Both services authenticate every request themselves (Gite
 the coordination server bearer tokens).
 
     docker build -f deploy/Dockerfile --target infra-ags --platform linux/amd64 -t <registry>/sa-infra:v1 .
+    docker push <registry>/sa-infra:v1        # AGS pulls the image itself; pin it by digest below
     export TENCENTCLOUD_SECRET_ID=... TENCENTCLOUD_SECRET_KEY=...
     export SA_COORD_ADMIN_TOKEN=... SA_GITEA_ADMIN_PASSWORD=...
-    export AGS_IMAGE=<registry>/sa-infra:v1 AGS_ROLE_ARN=qcs::cam::uin/<uin>:roleName/<role>
-    python scripts/ags_infra.py up      # idempotent; prints the URLs for the run file
-    python scripts/ags_infra.py down
+    export AGS_IMAGE=<registry>/sa-infra@sha256:<digest> AGS_ROLE_ARN=qcs::cam::uin/<uin>:roleName/<role>
+    python scripts/ags_infra.py up      # prints the URLs for the run file
+    python scripts/ags_infra.py down    # stops the instance; its data goes with it
+
+`up` reuses a live instance and checks that the credentials in the environment are the ones its
+services run with (it does not restart them); after `down` it starts a new instance with new URLs.
 
 Other settings: AGS_REGION (ap-singapore), AGS_ENDPOINT (ags.tencentcloudapi.com; international
 site: ags.intl.tencentcloudapi.com), AGS_IMAGE_REGISTRY_TYPE (personal), AGS_TOOL_NAME (sa-infra),
@@ -118,18 +122,30 @@ async def up() -> None:
             "SA_COORD_GITEA__URL": f"http://127.0.0.1:{GITEA_PORT}",
             "SA_COORD_GITEA__ADMIN_USER": gitea_user,
             "SA_COORD_GITEA__ADMIN_PASSWORD": gitea_password,
-            **{k: v for k, v in os.environ.items() if k.startswith("SA_COORD_") and k != "SA_COORD_ADMIN_TOKEN"},
         }
+        # Further SA_COORD_* settings pass through, but never replace the sandbox-internal values above.
+        env = {**{k: v for k, v in os.environ.items() if k.startswith("SA_COORD_")}, **env}
         await sbx.commands.run(
             "mkdir -p /opt/coord && exec scaling-agent coord serve >> /opt/coord/coord.log 2>&1",
             background=True, envs=env, cwd="/opt", user="root", timeout=0,
         )
         await wait_healthy(sbx, f"http://127.0.0.1:{COORD_PORT}/healthz", "/opt/coord/coord.log")
 
-    # The same URLs serve the launcher (this machine) and the workers (other sandboxes).
+    # The same URLs serve the launcher (this machine) and the workers (other sandboxes). Services that
+    # were already running keep the credentials they started with: prove they match the environment.
     async with httpx.AsyncClient(timeout=30) as http:
         for url in (f"{gitea_url}/api/healthz", f"{coord_url}/healthz"):
             (await http.get(url)).raise_for_status()
+        checks = (
+            (f"{coord_url}/api/admin/status", {"headers": {"Authorization": f"Bearer {admin_token}"}}),
+            (f"{gitea_url}/api/v1/user", {"auth": (gitea_user, gitea_password)}),
+        )
+        for url, auth in checks:
+            if (await http.get(url, **auth)).status_code != 200:
+                raise SystemExit(
+                    f"{url} rejects the credentials in the environment: the running services were started with "
+                    f"others. Run `{sys.argv[0]} down` first."
+                )
     print(f"instance: {iid}")
     print(f"coord_url / coord_public_url: {coord_url}")
     print(f"gitea.url / gitea.public_url: {gitea_url}")

@@ -45,6 +45,8 @@ def bootstrap_git(settings: RuntimeSettings) -> None:
         cred_file.chmod(0o600)
         helper = [f"store --file={cred_file}"]
     workdir = Path(settings.workdir)
+    adopted = state / "adopted"  # adopting resets the checkout: only ever on the first start of this state_dir
+    adopt = settings.adopt_checkout and (workdir / ".git").exists() and not adopted.exists()
     if not (workdir / ".git").exists():
         workdir.mkdir(parents=True, exist_ok=True)
         if any(workdir.iterdir()):
@@ -57,6 +59,13 @@ def bootstrap_git(settings: RuntimeSettings) -> None:
     _git("config", "pull.rebase", "false", cwd=local)
     if helper:
         _git("config", "credential.helper", helper[0], cwd=local)
+    if adopt:
+        branch = os.environ.get("SA_MAIN_BRANCH", "main")
+        remotes = subprocess.run(["git", "remote"], cwd=local, capture_output=True, text=True, check=True).stdout.split()
+        _git("remote", "set-url" if "origin" in remotes else "add", "origin", repo_url, cwd=local)
+        _git("fetch", "--quiet", "origin", branch, cwd=local)
+        _git("checkout", "--quiet", "--force", "-B", branch, f"origin/{branch}", cwd=local)
+        adopted.write_text("")
 
 
 async def fetch_prompts(settings: RuntimeSettings) -> tuple[str, str]:
@@ -76,6 +85,7 @@ async def amain() -> None:
     forwarded = {k: v for k, v in os.environ.items() if k.startswith(("ANTHROPIC_", "GITEA_"))}
     # Keep the harness's transcripts next to the runtime state, so a restarted runtime can resume them.
     forwarded["CLAUDE_CONFIG_DIR"] = str(Path(settings.state_dir) / "claude")
+    forwarded["PI_CODING_AGENT_DIR"] = str(Path(settings.state_dir) / "pi")
     harness = build_adapter(
         settings.harness,
         coord_url=settings.coord_url,
@@ -84,6 +94,8 @@ async def amain() -> None:
         drain=coord.drain,
         model=settings.model,
         env=forwarded,
+        main_branch=os.environ.get("SA_MAIN_BRANCH", "main"),
+        options=settings.harness_options,
     )
     runtime = WorkerRuntime(
         worker_id=settings.worker_id,

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import time
+from pathlib import Path
 
 import pytest
 
@@ -11,7 +13,7 @@ from scaling_agent.coord.render import render_turn_prompt
 from scaling_agent.coord.store import ValidationError
 from scaling_agent.launcher import schedule_offsets
 from scaling_agent.protocol import BoardType, Event, MergeStatus, Priority
-from scaling_agent.runtime.adapters.claude_code import pushes_protected
+from scaling_agent.runtime.adapters.guards import pushes_protected
 from scaling_agent.workspace.routing import route_webhook
 
 
@@ -171,18 +173,10 @@ def test_route_pr_to_involved_and_push_to_claim_holders():
 # ---------------------------------------------------------------- guard / sched
 
 
-@pytest.mark.parametrize(
-    ("cmd", "blocked"),
-    [
-        ("git push origin feature/main-fix", False),
-        ("git push -u origin w0001/latex", False),
-        ("git push origin main", True),
-        ("git push origin HEAD:main", True),
-        ("git push --force origin w1", True),
-        ("git push origin +w1", True),
-        ("make test && git push origin refs/heads/main", True),
-    ],
-)
+PUSH_GUARD_CASES = json.loads((Path(__file__).parent / "fixtures" / "push_guard_cases.json").read_text())
+
+
+@pytest.mark.parametrize(("cmd", "blocked"), PUSH_GUARD_CASES)
 def test_push_guard(cmd, blocked):
     assert pushes_protected(cmd) is blocked
 

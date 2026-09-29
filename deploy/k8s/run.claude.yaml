@@ -1,6 +1,7 @@
 # A real run on Kubernetes: Claude Code workers against an Anthropic Messages endpoint, here a
 # gateway serving a non-Claude model. Fill in the gateway and model, then:
-#   export ANTHROPIC_AUTH_TOKEN=...     # sent as Authorization: Bearer (ANTHROPIC_API_KEY sends x-api-key)
+#   export ANTHROPIC_AUTH_TOKEN=...     # sent as Authorization: Bearer (for x-api-key use ANTHROPIC_API_KEY in
+#                                       # both this file's forward_env and here)
 #   MODEL_EGRESS=<gateway-ip>/32:<port> deploy/k8s/up.sh deploy/k8s/run.claude.yaml <task.md>
 # MODEL_EGRESS is only needed when the gateway is not on port 443 or sits in a private range.
 name: k8s-claude
@@ -19,8 +20,9 @@ coord_url: http://coord:8700
 coord_public_url: http://coord:8700
 harness: claude_code
 model: <model>                     # passed to Claude Code as --model
-# Secrets come from the launcher's environment (sa-model Secret), never from this file.
-forward_env: [ANTHROPIC_AUTH_TOKEN, ANTHROPIC_API_KEY]
+# Secrets come from the launcher's environment (sa-model Secret), never from this file. Forward only
+# the one your gateway expects: with both set, Claude Code sends both X-Api-Key and Authorization.
+forward_env: [ANTHROPIC_AUTH_TOKEN]
 worker_env:
   ANTHROPIC_BASE_URL: http://<gateway-host>:<port>   # Claude Code appends /v1/messages
   # Claude Code resolves its internal model aliases (haiku for background work, subagents) through

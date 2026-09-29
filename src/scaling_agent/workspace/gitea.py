@@ -139,6 +139,9 @@ class GiteaClient:
         data = await self._request("POST", f"/users/{username}/tokens", json={"name": name, "scopes": scopes})
         return data["sha1"]
 
+    async def delete_token(self, username: str, name: str) -> None:
+        await self._request("DELETE", f"/users/{username}/tokens/{name}")
+
     async def add_collaborator(self, owner: str, repo: str, username: str, permission: str = "write") -> None:
         await self._request("PUT", f"/repos/{owner}/{repo}/collaborators/{username}", json={"permission": permission})
 

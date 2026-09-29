@@ -105,7 +105,7 @@ class AgsProvider(SandboxProvider):
             f"exec {self.s.runtime_command} >> {shlex.quote(state_dir)}/runtime.log 2>&1"
         )
         proc = await sbx.commands.run(
-            f"bash -lc {shlex.quote(cmd)}", background=True, envs=env, cwd="/workspace", user="root", timeout=0
+            f"bash -lc {shlex.quote(cmd)}", background=True, envs=env, cwd="/", user="root", timeout=0  # / exists in every image
         )
         handle.meta["pid"] = str(proc.pid)
 

@@ -42,8 +42,9 @@ launcher (持有 AK/SK)
 - envd 令牌的 `ExpiresAt` 在 2094 年，等于不过期。
 - envd 的 exec、文件读写、后台进程都正常（envd v0.5.14，镜像里自带 `/usr/bin/envd`）。
 - tool 的 `Resources` 不带 `Storage` 时，沙箱根盘只有约 1 GiB（`df -h /` 为 974M）。`provider.disk` 保持 `20Gi`。
-- tool 建好后配置改不了。`ensure_tool` 遇到同名但配置不同的 tool 会直接报错，
-  不会拿它接着用；这时要删掉旧 tool，或者换一个 `tool_name`。
+- tool 建好后配置改不了。`ensure_tool` 遇到同名但配置不同的 tool 会直接报错，不会拿它接着用；这时要删掉旧 tool，或者换一个 `tool_name`。
+  比较的是 Persistent、镜像、镜像库类型、角色、CPU/内存/磁盘、网络模式（含 VPC 子网和安全组）、端口。镜像只比字符串：
+  用可变 tag 时，同一个 tag 推了新内容发现不了，所以镜像要用 `@sha256:` 摘要固定。
   删掉 tool 后用同样的名字和镜像重建，AGS 会拒绝旧的 ClientToken（`FailedOperation.DuplicateRequest: Previous tool no longer exists`），
   `ensure_tool` 会换一个新 token 再建。
 - 暂停实例的配额是**整个账号共用**的（`PausedInstances` 上限 10）。满了以后 `PauseSandboxInstance` 返回 `LimitExceeded.PausedInstance`，
@@ -61,7 +62,9 @@ worker 沙箱访问不到你的主机时，可以把 Gitea 和 coord 放进另�
 - 访问地址是 `https://{port}-{instanceId}.{region}.tencentags.com`。launcher（本机）和 worker（别的沙箱）用同一个地址，
   所以运行文件里 `coord_url` 和 `coord_public_url` 填同一个，`gitea.url` 和 `gitea.public_url` 也填同一个。
 - Gitea 的 webhook 走 `127.0.0.1`，只放行 loopback。
-- `ags_infra.py up` 可以重复执行：已有实例就接着用，服务已经在跑就跳过；`down` 停掉实例。数据在沙箱本地盘上，停掉就没了。
+- `ags_infra.py up` 可以重复执行：已有存活的实例就接着用，服务已经在跑就不重启，但会用环境里的管理员凭证访问一次 coord 和 Gitea，
+  对不上就报错（要先 `down`）。`down` 停掉实例，数据在沙箱本地盘上，停掉就没了；之后再 `up` 会起一台新实例，URL 也是新的
+  （同一个 ClientToken 会让 AGS 把那台已停止的旧实例原样返回，`start_instance` 遇到这种情况会换新 token 重起，2026-09-29 实测）。
 
 2026-09-29 实测：4 个 scripted worker 跑 10 分钟，经转发地址 clone、push、调 MCP 都正常，8 个 PR 全部由合并队列合入。
 

@@ -11,6 +11,7 @@
 # and the merge-queue verifier need; no package-manager step, so builds work behind strict egress.
 ARG PYTHON_IMAGE=python:3.11-bookworm
 ARG GITEA_IMAGE=gitea/gitea:1.27.3
+ARG NODE_IMAGE=node:24-bookworm-slim
 
 FROM ${PYTHON_IMAGE} AS base
 RUN git --version
@@ -35,10 +36,15 @@ FROM base AS launcher
 RUN pip install ".[ags,k8s]"
 CMD ["scaling-agent", "--help"]
 
-# Worker: the runtime plus the harness (claude-agent-sdk bundles the Claude Code CLI).
+# Worker: the runtime plus the harnesses (claude-agent-sdk bundles the Claude Code CLI; the pi agent
+# is a Node program: run deploy/fetch-pi.sh first, deploy/k8s/build.sh does).
 # Extend this stage with the toolchain your task needs.
+FROM ${NODE_IMAGE} AS node
 FROM base AS worker
 RUN pip install ".[worker]"
+COPY --from=node /usr/local/bin/node /usr/local/bin/node
+COPY deploy/pi/ /opt/pi/
+RUN if [ -e /opt/pi/node_modules/.bin/pi ]; then ln -s /opt/pi/node_modules/.bin/pi /usr/local/bin/pi; fi
 RUN mkdir -p /workspace
 WORKDIR /workspace
 CMD ["scaling-agent", "worker", "run"]

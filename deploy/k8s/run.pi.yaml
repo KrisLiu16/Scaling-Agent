@@ -1,0 +1,41 @@
+# A real run on Kubernetes: pi workers against an OpenAI-compatible endpoint (docs/DESIGN.md 6.3).
+#   export OPENAI_API_KEY=...
+#   MODEL_EGRESS=<gateway-ip>/32:<port> deploy/k8s/up.sh deploy/k8s/run.pi.yaml <task.md>
+# MODEL_EGRESS is only needed when the gateway is not on port 443 or sits in a private range.
+name: k8s-pi
+task_file: /config/task.md
+workers: 4
+duration_s: 2400
+founders: 1
+founding_s: 300
+stagger:
+  - {interval_s: 60}
+max_queue_per_worker: 1.0
+reminders:
+  - {before_end_s: 600, text: "Stop dispatching new features. Ensure the build works and existing work is merged. Land open PRs through the merge queue; if a PR cannot land, say so and move on."}
+  - {before_end_s: 120, text: "Submit anything ready to the merge queue, then stop. Confirm the build works on main and post the final state."}
+coord_url: http://coord:8700
+coord_public_url: http://coord:8700
+harness: pi
+model: <model>
+harness_options:
+  base_url: http://<gateway-host>:<port>/v1
+  api: openai-responses
+  api_key_env: OPENAI_API_KEY
+  thinking: medium
+forward_env: [OPENAI_API_KEY]
+gitea:
+  url: http://gitea:3000
+  public_url: http://gitea:3000
+  owner: agents
+  repo: workspace
+  main_branch: main
+provider:
+  kind: k8s
+  image: sa-worker:dev
+  k8s_namespace: scaling-agent
+  k8s_image_pull_policy: IfNotPresent
+  cpu: "2"
+  memory: 4Gi
+  k8s_cpu_request: 500m
+  k8s_memory_request: 1Gi

@@ -1,0 +1,31 @@
+# syntax=docker/dockerfile:1
+# Worker image on top of a project's own image (for a run that continues an existing project): the
+# project keeps its toolchain, checkout and PATH; the worker runtime and the pi agent live under /opt
+# and are reached through two symlinks. The base needs python3.11 with venv, git and Node >= 22.19.
+#   deploy/fetch-pi.sh                                     # fills deploy/pi
+#   deploy/k8s/build.sh                                    # fills deploy/wheels (offline wheelhouse)
+#   docker build -f deploy/Dockerfile.project --build-arg TASK_IMAGE=<image> -t <name> .
+# Set the run file's provider.image to it and worker_env SA_WORKER_WORKDIR to the project's checkout
+# with SA_WORKER_ADOPT_CHECKOUT=1 (see docs/DESIGN.md 6.4).
+ARG TASK_IMAGE
+ARG ENVD_IMAGE=ccr.ccs.tencentyun.com/ags-image/envd:v0.5.14
+
+FROM ${ENVD_IMAGE} AS envd
+
+# The venv is built on the project's own python3.11, not the project's default python, so nothing
+# is installed into the environment the project's tests use.
+FROM ${TASK_IMAGE} AS runtime
+COPY deploy/wheels/ /wheels/
+COPY pyproject.toml README.md /src/
+COPY src /src/src
+RUN PIP_NO_INDEX=1 PIP_FIND_LINKS=/wheels PIP_NO_CACHE_DIR=1 sh -c \
+    '/usr/bin/python3.11 -m venv /opt/sa/venv && /opt/sa/venv/bin/pip install "/src[worker]"'
+
+FROM ${TASK_IMAGE}
+COPY --from=runtime /opt/sa /opt/sa
+COPY deploy/pi/ /opt/pi/
+COPY --from=envd /usr/bin/envd /usr/bin/envd
+RUN chmod 0755 /usr/bin/envd \
+ && ln -s /opt/sa/venv/bin/scaling-agent /usr/local/bin/scaling-agent \
+ && ln -s /opt/pi/node_modules/.bin/pi /usr/local/bin/pi
+CMD ["/usr/bin/envd", "-port", "49983"]

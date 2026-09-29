@@ -29,6 +29,7 @@ from tencentcloud.common.retry import StandardRetryer
 ENVD_PORT = 49983
 INSTANCE_FAILED = {"FAILED", "STARTING_FAILED", "STOPPING_FAILED", "STOP_FAILED", "PAUSE_FAILED", "RESUME_FAILED", "FORK_FAILED"}
 INSTANCE_ALIVE = {"STARTING", "RUNNING", "PAUSING", "PAUSED"}
+INSTANCE_ENDED = INSTANCE_FAILED | {"STOPPED", "STOPPING"}
 IDEMPOTENCY_HITS = ("FailedOperation.DuplicateRequest", "FailedOperation.RequestInProgress")
 
 
@@ -80,6 +81,7 @@ def tool_drift(tool: models.SandboxTool, spec: ToolSpec) -> list[str]:
     cc = tool.CustomConfiguration
     res = cc.Resources if cc else None
     net = tool.NetworkConfiguration
+    vpc = getattr(net, "VpcConfig", None)
     have = {
         "Persistent": bool(tool.Persistent),
         "Image": cc.Image if cc else None,
@@ -89,6 +91,8 @@ def tool_drift(tool: models.SandboxTool, spec: ToolSpec) -> list[str]:
         "Memory": res.Memory if res else None,
         "Storage": (res.Storage if res else None) or None,
         "NetworkMode": net.NetworkMode if net else None,
+        "SubnetIds": sorted(getattr(vpc, "SubnetIds", None) or []),
+        "SecurityGroupIds": sorted(getattr(vpc, "SecurityGroupIds", None) or []),
         "Ports": sorted(p.Port for p in (cc.Ports or [])) if cc else [],
     }
     want = {
@@ -100,6 +104,8 @@ def tool_drift(tool: models.SandboxTool, spec: ToolSpec) -> list[str]:
         "Memory": spec.memory,
         "Storage": spec.disk or None,
         "NetworkMode": spec.network_mode,
+        "SubnetIds": sorted(spec.subnet_ids) if spec.network_mode == "VPC" else [],  # only sent in VPC mode
+        "SecurityGroupIds": sorted(spec.security_group_ids) if spec.network_mode == "VPC" else [],
         "Ports": sorted({ENVD_PORT, *spec.extra_ports}),
     }
     return [f"{k}: {have[k]!r} != {want[k]!r}" for k in want if have[k] != want[k]]
@@ -257,7 +263,8 @@ class AgsControlPlane:
         """Idempotent per (run_id, worker_id, replaced instance); re-attaches to a live instance if any.
 
         The idempotency token of a replacement is derived from the dead instance's id, so it is
-        stable across launcher restarts yet different from the original start.
+        stable across launcher restarts yet different from the original start. If AGS hands back a
+        stopped instance for the token (same run name rerun), a fresh token is used.
         `auth_mode`: TOKEN puts every port behind X-Access-Token; PUBLIC keeps only envd behind it.
         """
         existing = self.find_worker_instance(tool_id, worker_id, run_id)
@@ -280,6 +287,11 @@ class AgsControlPlane:
             inst = self.find_worker_instance(tool_id, worker_id, run_id)
             if inst is None:
                 raise
+        if inst.Status in INSTANCE_ENDED:
+            # AGS answers a repeated ClientToken with the instance it created the first time, here one
+            # that has since stopped (a rerun under the same run name): start a new one instead.
+            req.ClientToken = client_token("StartSandboxInstance", run_id, worker_id, str(time.time_ns()))
+            inst = self.c.StartSandboxInstance(req).Instance
         return self.wait_running(inst.InstanceId, wait_s)
 
     def wait_running(self, instance_id: str, wait_s: float = 600, interval: float = 3) -> models.SandboxInstance:
@@ -289,7 +301,7 @@ class AgsControlPlane:
             status = inst.Status if inst else None
             if status == "RUNNING":
                 return inst
-            if status in INSTANCE_FAILED or status == "STOPPED":
+            if status in INSTANCE_ENDED:
                 raise AgsError(f"instance {instance_id} -> {status} (StopReason={getattr(inst, 'StopReason', None)})")
             time.sleep(interval)
         raise AgsError(f"instance {instance_id} not RUNNING after {wait_s:.0f}s")

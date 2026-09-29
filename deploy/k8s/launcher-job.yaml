@@ -27,6 +27,8 @@ spec:
               valueFrom: {secretKeyRef: {name: sa-model, key: anthropic-api-key, optional: true}}
             - name: ANTHROPIC_AUTH_TOKEN
               valueFrom: {secretKeyRef: {name: sa-model, key: anthropic-auth-token, optional: true}}
+            - name: OPENAI_API_KEY
+              valueFrom: {secretKeyRef: {name: sa-model, key: openai-api-key, optional: true}}
           volumeMounts: [{name: run, mountPath: /config}]
       volumes:
         - name: run

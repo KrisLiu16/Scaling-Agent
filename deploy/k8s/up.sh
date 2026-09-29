@@ -4,9 +4,12 @@
 # Images must already be available to the cluster (deploy/k8s/build.sh; for kind, KIND_CLUSTER=...).
 # Targets the current kubectl context: point KUBECONFIG at the right cluster first.
 #
-# Model access for claude_code runs (non-secret settings such as ANTHROPIC_BASE_URL and
-# ANTHROPIC_MODEL go into the run file's worker_env):
-#   ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY   stored in the sa-model Secret for the launcher, which
+# Model credentials are only refreshed when the variable is set (they cannot be derived from nothing);
+# the egress policy follows MODEL_EGRESS on every call, so an unset MODEL_EGRESS removes it.
+# Model access (non-secret settings go into the run file: worker_env for claude_code, harness_options for pi):
+#   ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY   claude_code runs
+#   OPENAI_API_KEY                              pi runs against an OpenAI-compatible endpoint
+#                                               all stored in the sa-model Secret for the launcher, which
 #                                               forwards the names listed in the run file's forward_env
 #   MODEL_EGRESS=<cidr>:<port>[,...]           extra worker egress, e.g. a model gateway that is not
 #                                               on port 443 or sits in a private range
@@ -27,10 +30,11 @@ fi
 
 # Model credentials: refreshed on every call that provides them. printf is a builtin, so the values
 # never appear on a command line.
-if [ -n "${ANTHROPIC_AUTH_TOKEN:-}${ANTHROPIC_API_KEY:-}" ]; then
+if [ -n "${ANTHROPIC_AUTH_TOKEN:-}${ANTHROPIC_API_KEY:-}${OPENAI_API_KEY:-}" ]; then
   kubectl -n "$NS" create secret generic sa-model --from-env-file=<(
     [ -z "${ANTHROPIC_AUTH_TOKEN:-}" ] || printf 'anthropic-auth-token=%s\n' "$ANTHROPIC_AUTH_TOKEN"
     [ -z "${ANTHROPIC_API_KEY:-}" ] || printf 'anthropic-api-key=%s\n' "$ANTHROPIC_API_KEY"
+    [ -z "${OPENAI_API_KEY:-}" ] || printf 'openai-api-key=%s\n' "$OPENAI_API_KEY"
   ) --dry-run=client -o yaml | kubectl apply -f -
 fi
 

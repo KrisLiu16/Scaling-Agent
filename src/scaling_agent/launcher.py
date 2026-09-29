@@ -15,6 +15,7 @@ Schedule (improving on Agensh's fixed 30s/3s stagger):
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import secrets
@@ -28,7 +29,8 @@ import httpx
 from .config import RunConfig
 from .prompts import template_text
 from .sandbox.base import SandboxHandle, SandboxProvider
-from .workspace.gitea import GiteaClient
+from .workspace.gitea import GiteaClient, GiteaError
+from .workspace.seed import seed_repository
 
 log = logging.getLogger(__name__)
 
@@ -92,6 +94,8 @@ class Launcher:
         gitea_tokens: dict[str, str] = {}
         if self.gitea is not None:
             await self._wait_for_repo()
+            if g.seed_dir:
+                await self._seed_repository()
             await self.gitea.ensure_task_issue(g.owner, g.repo, f"Task: {self.run.name}", task)
             for wid in ids:
                 await self.gitea.ensure_user(wid, secrets.token_urlsafe(24))
@@ -134,10 +138,33 @@ class Launcher:
             }
             if self.run.model:
                 env["SA_WORKER_MODEL"] = self.run.model
+            if self.run.harness_options:
+                env["SA_WORKER_HARNESS_OPTIONS"] = json.dumps(self.run.harness_options)
             if wid in gitea_tokens:
                 env["GITEA_TOKEN"] = gitea_tokens[wid]
             self.envs[wid] = env
         await self.provider.prepare()
+
+    async def _seed_repository(self, timeout_s: float = 120.0) -> None:
+        """Import `gitea.seed_dir` as main's starting point, as the merge bot (only it may write main)."""
+        assert self.gitea is not None
+        g = self.run.gitea
+        deadline = self._clock() + timeout_s
+        name = f"seed-{secrets.token_hex(4)}"
+        while True:
+            try:  # the coordination server creates the bot while it bootstraps Gitea
+                token = await self.gitea.create_token(g.bot_user, name, ["write:repository"])
+                break
+            except GiteaError as e:
+                if self._clock() > deadline:
+                    raise RuntimeError(f"cannot mint a token for {g.bot_user}: {e}") from e
+                await self._sleep(5)
+        try:
+            repo_url = f"{g.url.rstrip('/')}/{g.owner}/{g.repo}.git"
+            imported = await asyncio.to_thread(seed_repository, repo_url, token, Path(g.seed_dir), g.main_branch)
+        finally:
+            await self.gitea.delete_token(g.bot_user, name)
+        log.info("seed %s: %s", g.seed_dir, "imported" if imported else "already imported")
 
     async def _wait_for_repo(self, timeout_s: float = 300.0) -> None:
         """The coordination server bootstraps the repository; wait for it instead of racing it."""

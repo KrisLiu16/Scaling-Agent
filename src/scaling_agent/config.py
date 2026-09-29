@@ -7,7 +7,7 @@ Secrets come from environment variables; everything else can live in a YAML run 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, Field
@@ -29,6 +29,9 @@ class GiteaSettings(BaseModel):
     bot_user: str = "merge-bot"
     bot_token: str | None = None  # the only identity allowed to merge into main (created if absent)
     webhook_secret: str | None = None  # generated if absent
+    # Launcher only: a directory whose files become the repository's content before the workers start
+    # (one import commit on top of main), for runs that continue an existing project.
+    seed_dir: str | None = None
 
     @property
     def worker_url(self) -> str:
@@ -72,8 +75,12 @@ class RuntimeSettings(BaseSettings):
     token: str  # per-worker bearer token for the coordination server
     workdir: str = "/workspace/repo"  # the git checkout
     state_dir: str = "/workspace/state"  # runtime state, git credentials, harness transcripts (outside the checkout)
-    harness: Literal["claude_code", "scripted", "fake"] = "claude_code"
+    harness: Literal["claude_code", "pi", "scripted", "fake"] = "claude_code"
     model: str | None = None
+    harness_options: dict[str, Any] = Field(default_factory=dict)  # per-harness settings, e.g. pi's PiOptions
+    # Use a checkout that already exists in the image (the project's own directory) instead of cloning:
+    # point it at the shared repository and reset it to that repository's main branch.
+    adopt_checkout: bool = False
     # With nothing new for this long, start a "continue" turn (Agensh waits 10 minutes).
     continue_after_s: float = 60.0
     max_continue_after_s: float = 600.0  # idle backoff cap
@@ -104,7 +111,7 @@ class ProviderSettings(BaseModel):
     endpoint: str = "ags.tencentcloudapi.com"
     data_plane_domain: str | None = None  # default: {region}.tencentags.com
     tool_name: str = "sa-worker"
-    image: str | None = None  # linux/amd64 image that contains /usr/bin/envd (see deploy/worker.Dockerfile)
+    image: str | None = None  # linux/amd64 image that contains /usr/bin/envd (deploy/Dockerfile, target worker-ags)
     image_registry_type: Literal["enterprise", "personal", "custom"] = "personal"
     role_arn: str | None = None  # required by AGS to pull from TCR/CCR and to mount storage
     cpu: str = "2"
@@ -161,8 +168,9 @@ class RunConfig(BaseModel):
     )
     coord_url: str = "http://127.0.0.1:8700"
     coord_public_url: str | None = None  # address reachable from sandboxes
-    harness: Literal["claude_code", "scripted", "fake"] = "claude_code"
+    harness: Literal["claude_code", "pi", "scripted", "fake"] = "claude_code"
     model: str | None = None
+    harness_options: dict[str, Any] = Field(default_factory=dict)  # non-secret settings of the harness
     provider: ProviderSettings = Field(default_factory=ProviderSettings)
     gitea: GiteaSettings = Field(default_factory=GiteaSettings)
     # Environment variables forwarded into every worker sandbox (names only; values come from the
